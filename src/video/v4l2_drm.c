@@ -267,7 +267,12 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
     return -1;
   }
 
-  pthread_mutex_init(&ctx->drm_lock, NULL);
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+  pthread_mutex_init(&ctx->drm_lock, &attr);
+  pthread_mutexattr_destroy(&attr);
+
   ctx->flip_pending = false;
   ctx->current_displayed_idx = -1;
   ctx->pending_flip_idx = -1;

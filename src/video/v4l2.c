@@ -28,9 +28,37 @@
 #include <string.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sched.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 
 static struct v4l2_ctx v4l2_instance;
+
+static void configure_realtime_thread(pthread_t thread, int target_priority) {
+  int min_prio = sched_get_priority_min(SCHED_FIFO);
+  int max_prio = sched_get_priority_max(SCHED_FIFO);
+  if (min_prio < 0 || max_prio < 0) {
+    min_prio = 1;
+    max_prio = 99;
+  }
+
+  /* Clamp priority safely within system bounds */
+  if (target_priority < min_prio) target_priority = min_prio;
+  if (target_priority > max_prio) target_priority = max_prio;
+
+  struct sched_param param;
+  memset(&param, 0, sizeof(param));
+  param.sched_priority = target_priority;
+
+  int ret = pthread_setschedparam(thread, SCHED_FIFO, &param);
+  if (ret == 0) {
+    fprintf(stderr, "V4L2: Successfully enabled SCHED_FIFO real-time priority (%d) for display thread\n", target_priority);
+  } else if (ret == EPERM) {
+    fprintf(stderr, "V4L2: Note: SCHED_FIFO requires elevated permissions (CAP_SYS_NICE or rtprio limits in /etc/security/limits.conf). Continuing with default scheduler.\n");
+  } else {
+    fprintf(stderr, "V4L2: Note: pthread_setschedparam failed: %s (code %d). Continuing with default scheduler.\n", strerror(ret), ret);
+  }
+}
 
 static void *v4l2_event_thread(void *arg) {
   struct v4l2_ctx *ctx = (struct v4l2_ctx *)arg;
@@ -146,6 +174,9 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
     pthread_mutex_destroy(&v4l2_instance.state_mutex);
     return -1;
   }
+
+  /* Elevate display presentation thread to real-time priority (45: optimal for video display) */
+  configure_realtime_thread(v4l2_instance.event_thread, 45);
 
   return DR_OK;
 }
