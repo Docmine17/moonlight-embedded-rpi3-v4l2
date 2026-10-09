@@ -37,8 +37,8 @@ sudo apt install -y cmake build-essential libdrm-dev libv4l-dev libevdev-dev \
 ### 2. Build
 
 ```bash
-git clone https://github.com/<your-repo>/moonlight-embedded.git
-cd moonlight-embedded
+git clone https://github.com/Docmine17/moonlight-embedded-rpi3-v4l2.git
+cd moonlight-embedded-rpi3-v4l2
 mkdir build && cd build
 cmake ..
 make -j4
