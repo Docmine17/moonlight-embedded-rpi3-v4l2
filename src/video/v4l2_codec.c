@@ -213,10 +213,23 @@ int v4l2_codec_feed_packet(struct v4l2_ctx *ctx, const uint8_t *data, size_t len
    * If all buffers are in flight, wait briefly (up to 12ms total) for the hardware
    * to release one instead of immediately dropping or causing an IDR cascade. */
   for (int attempt = 0; attempt < 4; attempt++) {
+    memset(&buf, 0, sizeof(buf));
+    memset(planes, 0, sizeof(planes));
+    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.length = 1;
+    buf.m.planes = planes;
+
     while (ioctl(ctx->v4l2_fd, VIDIOC_DQBUF, &buf) == 0) {
       if ((int)buf.index < ctx->num_output_bufs) {
         ctx->output_bufs[buf.index].queued = false;
       }
+      memset(&buf, 0, sizeof(buf));
+      memset(planes, 0, sizeof(planes));
+      buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.length = 1;
+      buf.m.planes = planes;
     }
 
     for (int i = 0; i < ctx->num_output_bufs; i++) {
