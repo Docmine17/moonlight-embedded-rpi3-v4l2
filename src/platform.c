@@ -73,6 +73,20 @@ enum platform platform_check(char* name) {
       return RK;
   }
   #endif
+  #ifdef HAVE_V4L2
+  if (std || strcmp(name, "v4l2") == 0) {
+    bool hardware_present = (access("/dev/video10", F_OK) == 0 ||
+                             access("/dev/video11", F_OK) == 0 ||
+                             access("/dev/video12", F_OK) == 0) &&
+                            (access("/dev/dri/card0", F_OK) == 0 ||
+                             access("/dev/dri/card1", F_OK) == 0);
+    if (!std || hardware_present) {
+      void *handle = dlopen("libmoonlight-v4l2.so", RTLD_NOW | RTLD_GLOBAL);
+      if (handle != NULL && dlsym(RTLD_DEFAULT, "decoder_callbacks_v4l2") != NULL)
+        return V4L2;
+    }
+  }
+  #endif
   #ifdef HAVE_X11
   bool x11 = strcmp(name, "x11") == 0;
   bool vdpau = strcmp(name, "x11_vdpau") == 0;
@@ -176,6 +190,10 @@ DECODER_RENDERER_CALLBACKS* platform_get_video(enum platform system) {
   case RK:
     return (PDECODER_RENDERER_CALLBACKS) dlsym(RTLD_DEFAULT, "decoder_callbacks_rk");
   #endif
+  #ifdef HAVE_V4L2
+  case V4L2:
+    return (PDECODER_RENDERER_CALLBACKS) dlsym(RTLD_DEFAULT, "decoder_callbacks_v4l2");
+  #endif
   }
   return NULL;
 }
@@ -241,6 +259,8 @@ char* platform_name(enum platform system) {
     return "AMLogic VPU";
   case RK:
     return "Rockchip VPU";
+  case V4L2:
+    return "V4L2 M2M + DRM/KMS";
   case X11:
     return "X Window System (software decoding)";
   case X11_VAAPI:

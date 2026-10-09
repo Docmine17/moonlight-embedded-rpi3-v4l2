@@ -48,3 +48,7 @@ extern DECODER_RENDERER_CALLBACKS decoder_callbacks_x11_vdpau;
 #ifdef HAVE_SDL
 extern DECODER_RENDERER_CALLBACKS decoder_callbacks_sdl;
 #endif
+#ifdef HAVE_V4L2
+extern DECODER_RENDERER_CALLBACKS decoder_callbacks_v4l2;
+#endif
+
