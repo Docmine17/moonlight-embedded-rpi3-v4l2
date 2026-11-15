@@ -128,6 +128,7 @@ struct v4l2_ctx {
   pthread_mutex_t state_mutex;
   atomic_bool running;
   atomic_bool streaming;
+  bool submit_rt_configured;
   pthread_t event_thread;
 };
 

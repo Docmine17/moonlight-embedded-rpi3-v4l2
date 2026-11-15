@@ -176,6 +176,20 @@ if(ENABLE_V4L2 AND LIBDRM_FOUND)
   target_include_directories(moonlight-v4l2 PRIVATE ${LIBDRM_INCLUDE_DIRS} ${GAMESTREAM_INCLUDE_DIR} ${MOONLIGHT_COMMON_INCLUDE_DIR})
   target_link_libraries(moonlight-v4l2 gamestream ${LIBDRM_LIBRARIES})
   install(TARGETS moonlight-v4l2 DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+  enable_testing()
+  add_executable(test_v4l2_backend
+    ./test/test_v4l2_backend.c
+    ./src/video/v4l2_drm.c
+  )
+  target_include_directories(test_v4l2_backend PRIVATE
+    ${LIBDRM_INCLUDE_DIRS}
+    ${GAMESTREAM_INCLUDE_DIR}
+    ${MOONLIGHT_COMMON_INCLUDE_DIR}
+    ./third_party/h264bitstream
+  )
+  target_link_libraries(test_v4l2_backend gamestream ${LIBDRM_LIBRARIES} pthread)
+  add_test(NAME test_v4l2_backend COMMAND test_v4l2_backend)
 endif()
 
 if (SOFTWARE_FOUND)

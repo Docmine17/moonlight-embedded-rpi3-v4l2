@@ -12,9 +12,15 @@
 #include "../src/video/v4l2_drm.h"
 #include "../src/video/v4l2_codec.h"
 
+#include <sps.h>
+#include <h264_stream.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 
 static int g_requeued_indices[32];
@@ -182,11 +188,156 @@ static void test_staging_slot_state_machine(void) {
   printf("  -> Staging slot state machine and buffer recycling PASSED.\n");
 }
 
+static void test_sps_vui_low_latency_fixup(void) {
+  printf("[TEST] Testing H.264 SPS VUI Low-Latency Fixup & Level Clamping...\n");
+
+  uint8_t in_buf[256];
+  uint8_t out_buf[256];
+  LENTRY entry;
+  memset(&entry, 0, sizeof(entry));
+  entry.bufferType = BUFFER_TYPE_SPS;
+
+  /* Case 1: 720p stream with Level 5.0 (50) and VUI absent */
+  h264_stream_t *h_in = h264_new();
+  assert(h_in != NULL);
+  h_in->nal->nal_ref_idc = NAL_REF_IDC_PRIORITY_HIGHEST;
+  h_in->nal->nal_unit_type = NAL_UNIT_TYPE_SPS;
+  h_in->sps->profile_idc = 100;
+  h_in->sps->chroma_format_idc = 1;
+  h_in->sps->level_idc = 50;
+  h_in->sps->num_ref_frames = 4;
+  h_in->sps->pic_width_in_mbs_minus1 = 79;
+  h_in->sps->pic_height_in_map_units_minus1 = 44;
+  h_in->sps->frame_mbs_only_flag = 1;
+  h_in->sps->direct_8x8_inference_flag = 1;
+  h_in->sps->vui_parameters_present_flag = 0;
+
+  in_buf[0] = 0x00;
+  in_buf[1] = 0x00;
+  in_buf[2] = 0x00;
+  in_buf[3] = 0x01;
+  int in_nal_len = write_nal_unit(h_in, in_buf + 4, (int)sizeof(in_buf) - 4);
+  assert(in_nal_len > 0);
+  h264_free(h_in);
+
+  entry.data = (char *)in_buf;
+  entry.length = 4 + in_nal_len;
+
+  gs_sps_init(1280, 720);
+  uint32_t out_len = 0;
+  gs_sps_fix(&entry, GS_SPS_BITSTREAM_FIXUP, out_buf, &out_len);
+  assert(out_len > 4);
+
+  h264_stream_t *h_out = h264_new();
+  assert(h_out != NULL);
+  int parsed = read_nal_unit(h_out, out_buf + 4, (int)(out_len - 4));
+  assert(parsed > 0);
+  assert(h_out->sps->vui_parameters_present_flag == 1);
+  assert(h_out->sps->vui.bitstream_restriction_flag == 1);
+  assert(h_out->sps->vui.num_reorder_frames == 0);
+  assert(h_out->sps->vui.max_dec_frame_buffering == 1);
+  assert(h_out->sps->level_idc == 32);
+  assert(h_out->sps->num_ref_frames == 1);
+  h264_free(h_out);
+
+  /* Case 2: 1080p stream with existing bitstream_restriction_flag=1, reorder=4, level=50 */
+  h_in = h264_new();
+  assert(h_in != NULL);
+  h_in->nal->nal_ref_idc = NAL_REF_IDC_PRIORITY_HIGHEST;
+  h_in->nal->nal_unit_type = NAL_UNIT_TYPE_SPS;
+  h_in->sps->profile_idc = 100;
+  h_in->sps->chroma_format_idc = 1;
+  h_in->sps->level_idc = 50;
+  h_in->sps->num_ref_frames = 4;
+  h_in->sps->pic_width_in_mbs_minus1 = 119;
+  h_in->sps->pic_height_in_map_units_minus1 = 67;
+  h_in->sps->frame_mbs_only_flag = 1;
+  h_in->sps->direct_8x8_inference_flag = 1;
+  h_in->sps->vui_parameters_present_flag = 1;
+  h_in->sps->vui.bitstream_restriction_flag = 1;
+  h_in->sps->vui.motion_vectors_over_pic_boundaries_flag = 1;
+  h_in->sps->vui.log2_max_mv_length_horizontal = 16;
+  h_in->sps->vui.log2_max_mv_length_vertical = 16;
+  h_in->sps->vui.num_reorder_frames = 4;
+  h_in->sps->vui.max_dec_frame_buffering = 8;
+
+  in_nal_len = write_nal_unit(h_in, in_buf + 4, (int)sizeof(in_buf) - 4);
+  assert(in_nal_len > 0);
+  h264_free(h_in);
+
+  entry.length = 4 + in_nal_len;
+  gs_sps_init(1920, 1080);
+  out_len = 0;
+  gs_sps_fix(&entry, GS_SPS_BITSTREAM_FIXUP, out_buf, &out_len);
+  assert(out_len > 4);
+
+  h_out = h264_new();
+  assert(h_out != NULL);
+  parsed = read_nal_unit(h_out, out_buf + 4, (int)(out_len - 4));
+  assert(parsed > 0);
+  assert(h_out->sps->vui_parameters_present_flag == 1);
+  assert(h_out->sps->vui.bitstream_restriction_flag == 1);
+  assert(h_out->sps->vui.num_reorder_frames == 0);
+  assert(h_out->sps->vui.max_dec_frame_buffering == 1);
+  assert(h_out->sps->level_idc == 42);
+  h264_free(h_out);
+
+  printf("  -> H.264 SPS VUI fixup and level clamping PASSED.\n");
+}
+
+static void test_export_fd_cleanup_safety(void) {
+  printf("[TEST] Testing export_fd=-1 Cleanup Safety (No Close on fd 0)...\n");
+
+  struct v4l2_ctx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.drm_fd = -1;
+  ctx.num_capture_bufs = 4;
+  for (int i = 0; i < V4L2_MAX_CAPTURE_BUFFERS; i++) {
+    ctx.capture_bufs[i].export_fd = -1;
+  }
+
+  v4l2_drm_release_capture_buffers(&ctx);
+
+  assert(fcntl(0, F_GETFD) != -1);
+  for (int i = 0; i < V4L2_MAX_CAPTURE_BUFFERS; i++) {
+    assert(ctx.capture_bufs[i].export_fd == -1);
+  }
+
+  printf("  -> export_fd=-1 cleanup safety PASSED.\n");
+}
+
+static void test_colorspace_and_full_props_flag(void) {
+  printf("[TEST] Testing Colorspace Mapping and Full-Props Commit Flag...\n");
+
+  struct v4l2_ctx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.val_color_encoding_bt601 = 0;
+  ctx.val_color_encoding_bt709 = 1;
+  ctx.val_color_range_limited = 0;
+  ctx.val_color_range_full = 1;
+
+  v4l2_drm_set_colorspace(&ctx, V4L2_COLORSPACE_REC709, V4L2_QUANTIZATION_LIM_RANGE);
+  assert(ctx.color_encoding == ctx.val_color_encoding_bt709);
+  assert(ctx.color_range == ctx.val_color_range_limited);
+  assert(ctx.plane_needs_full_props == true);
+
+  ctx.plane_needs_full_props = false;
+  v4l2_drm_set_colorspace(&ctx, V4L2_COLORSPACE_SMPTE170M, V4L2_QUANTIZATION_FULL_RANGE);
+  assert(ctx.color_encoding == ctx.val_color_encoding_bt601);
+  assert(ctx.color_range == ctx.val_color_range_full);
+  assert(ctx.plane_needs_full_props == true);
+
+  printf("  -> Colorspace mapping and full-props flag PASSED.\n");
+}
+
 int main(void) {
   printf("=== RUNNING V4L2 BACKEND TEST SUITE ===\n");
   test_geometry_scaling();
   test_macroblock_padding_handling();
   test_staging_slot_state_machine();
+  test_sps_vui_low_latency_fixup();
+  test_export_fd_cleanup_safety();
+  test_colorspace_and_full_props_flag();
   printf("=== ALL V4L2 BACKEND TESTS PASSED SUCCESSFULLY! ===\n");
   return 0;
 }

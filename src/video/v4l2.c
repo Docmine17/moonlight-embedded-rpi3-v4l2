@@ -17,6 +17,8 @@
  * along with Moonlight; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
+
 #include "v4l2.h"
 #include "v4l2_drm.h"
 #include "v4l2_codec.h"
@@ -31,10 +33,15 @@
 #include <sched.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#ifndef MCL_ONFAULT
+#define MCL_ONFAULT 4
+#endif
 
 static struct v4l2_ctx v4l2_instance;
 
-static void configure_realtime_thread(pthread_t thread, int target_priority) {
+static void configure_realtime_thread(pthread_t thread, int target_priority, const char *role) {
   int min_prio = sched_get_priority_min(SCHED_FIFO);
   int max_prio = sched_get_priority_max(SCHED_FIFO);
   if (min_prio < 0 || max_prio < 0) {
@@ -52,11 +59,11 @@ static void configure_realtime_thread(pthread_t thread, int target_priority) {
 
   int ret = pthread_setschedparam(thread, SCHED_FIFO, &param);
   if (ret == 0) {
-    fprintf(stderr, "V4L2: Successfully enabled SCHED_FIFO real-time priority (%d) for display thread\n", target_priority);
+    fprintf(stderr, "V4L2: Successfully enabled SCHED_FIFO real-time priority (%d) for %s thread\n", target_priority, role);
   } else if (ret == EPERM) {
-    fprintf(stderr, "V4L2: Note: SCHED_FIFO requires elevated permissions (CAP_SYS_NICE or rtprio limits in /etc/security/limits.conf). Continuing with default scheduler.\n");
+    fprintf(stderr, "V4L2: Note: SCHED_FIFO for %s thread requires elevated permissions (CAP_SYS_NICE or rtprio limits in /etc/security/limits.conf). Continuing with default scheduler.\n", role);
   } else {
-    fprintf(stderr, "V4L2: Note: pthread_setschedparam failed: %s (code %d). Continuing with default scheduler.\n", strerror(ret), ret);
+    fprintf(stderr, "V4L2: Note: pthread_setschedparam (%s) failed: %s (code %d). Continuing with default scheduler.\n", role, strerror(ret), ret);
   }
 }
 
@@ -157,6 +164,14 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
   v4l2_instance.stream_width = width;
   v4l2_instance.stream_height = height;
 
+  if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) == 0) {
+    fprintf(stderr, "V4L2: Locked process memory pages (MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)\n");
+  } else if (mlockall(MCL_CURRENT) == 0) {
+    fprintf(stderr, "V4L2: Locked current process memory pages (MCL_CURRENT)\n");
+  } else {
+    fprintf(stderr, "V4L2: Note: mlockall failed: %s (CAP_IPC_LOCK or memlock limit required)\n", strerror(errno));
+  }
+
   pthread_mutex_init(&v4l2_instance.state_mutex, NULL);
 
   gs_sps_init(width, height);
@@ -188,7 +203,7 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
   }
 
   /* Elevate display presentation thread to real-time priority (45: optimal for video display) */
-  configure_realtime_thread(v4l2_instance.event_thread, 45);
+  configure_realtime_thread(v4l2_instance.event_thread, 45, "display");
 
   return DR_OK;
 }
@@ -240,6 +255,11 @@ static int v4l2_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   if (!atomic_load(&v4l2_instance.streaming) || !atomic_load(&v4l2_instance.running)) {
     pthread_mutex_unlock(&v4l2_instance.state_mutex);
     return DR_OK;
+  }
+
+  if (!v4l2_instance.submit_rt_configured) {
+    v4l2_instance.submit_rt_configured = true;
+    configure_realtime_thread(pthread_self(), 40, "submit");
   }
 
   /* Allow extra wait during initial DRC or IDR frames so the first keyframe isn't dropped */

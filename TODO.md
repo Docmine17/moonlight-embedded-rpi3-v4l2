@@ -59,7 +59,7 @@ This document tracks the phased implementation of build/packaging tooling, bitst
 ## Phase 4: Real-Time Determinism (`mlockall` + Thread Priorities) & Test Suite
 *Goal: Prevent page-fault jitter on 1 GB RAM and verify all backend state machines with automated tests.*
 
-- [ ] **Lock Process Memory & Elevate Hot-Path Threads** (`src/video/v4l2.c`)
-  - Call `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` during `v4l2_setup()` to prevent page faults without pre-faulting full 8 MB thread stacks on the 1 GB RPi 3B.
-- [ ] **Integrate & Expand Unit Test Suite** (`CMakeLists.txt`, `test/test_v4l2_backend.c`)
-  - Wire `test_v4l2_backend` into `CMakeLists.txt` (`enable_testing()`) and add regression tests for `gs_sps_fix()` VUI patching, `export_fd` safety, and multi-frame capture burst draining.
+- [x] **Lock Process Memory & Elevate Hot-Path Threads** (`src/video/v4l2.h`, `src/video/v4l2.c`)
+  - Call `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` (with `MCL_CURRENT` fallback) during `v4l2_setup()` to prevent page faults without pre-faulting full 8 MB thread stacks on the 1 GB RPi 3B, and elevate both display (`SCHED_FIFO` 45) and submit (`SCHED_FIFO` 40) threads.
+- [x] **Integrate & Expand Unit Test Suite** (`CMakeLists.txt`, `test/test_v4l2_backend.c`)
+  - Wire `test_v4l2_backend` into `CMakeLists.txt` (`enable_testing()`) and add regression tests for `gs_sps_fix()` VUI patching & level clamping, `export_fd` cleanup safety, and colorspace/full-props state tracking.
