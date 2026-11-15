@@ -79,6 +79,8 @@ struct v4l2_ctx {
   uint32_t crtc_id;
   uint32_t plane_id;
   uint32_t conn_id;
+  drmModeAtomicReqPtr atomic_req;
+  bool plane_needs_full_props;
 
   /* DRM plane atomic property IDs */
   uint32_t prop_fb_id;
@@ -91,6 +93,29 @@ struct v4l2_ctx {
   uint32_t prop_src_y;
   uint32_t prop_src_w;
   uint32_t prop_src_h;
+
+  /* Optional DRM plane color space properties */
+  uint32_t prop_color_encoding;
+  uint32_t prop_color_range;
+  uint64_t val_color_encoding_bt601;
+  uint64_t val_color_encoding_bt709;
+  uint64_t val_color_range_limited;
+  uint64_t val_color_range_full;
+  uint64_t color_encoding;
+  uint64_t color_range;
+
+  /* Saved initial plane state for console restoration */
+  bool orig_plane_restored;
+  uint64_t orig_fb_id;
+  uint64_t orig_crtc_id;
+  uint64_t orig_crtc_x;
+  uint64_t orig_crtc_y;
+  uint64_t orig_crtc_w;
+  uint64_t orig_crtc_h;
+  uint64_t orig_src_x;
+  uint64_t orig_src_y;
+  uint64_t orig_src_w;
+  uint64_t orig_src_h;
 
   /* Presentation and page-flip synchronization */
   pthread_mutex_t drm_lock;

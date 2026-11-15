@@ -30,7 +30,8 @@
 #include <poll.h>
 #include <libdrm/drm_fourcc.h>
 
-static int get_property_id(int fd, uint32_t obj_id, uint32_t obj_type, const char *name, uint32_t *prop_id) {
+static int get_property_info(int fd, uint32_t obj_id, uint32_t obj_type, const char *name,
+                             uint32_t *prop_id, uint64_t *init_val) {
   drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, obj_id, obj_type);
   if (!props)
     return -1;
@@ -41,7 +42,10 @@ static int get_property_id(int fd, uint32_t obj_id, uint32_t obj_type, const cha
       continue;
 
     if (strcmp(prop->name, name) == 0) {
-      *prop_id = prop->prop_id;
+      if (prop_id)
+        *prop_id = prop->prop_id;
+      if (init_val)
+        *init_val = props->prop_values[i];
       drmModeFreeProperty(prop);
       drmModeFreeObjectProperties(props);
       return 0;
@@ -51,6 +55,43 @@ static int get_property_id(int fd, uint32_t obj_id, uint32_t obj_type, const cha
 
   drmModeFreeObjectProperties(props);
   return -1;
+}
+
+static uint64_t get_plane_type(int fd, uint32_t plane_id) {
+  uint64_t type = DRM_PLANE_TYPE_OVERLAY;
+  get_property_info(fd, plane_id, DRM_MODE_OBJECT_PLANE, "type", NULL, &type);
+  return type;
+}
+
+static void get_color_enum_property(int fd, uint32_t plane_id, const char *prop_name,
+                                    uint32_t *prop_id,
+                                    const char *enum_a, uint64_t *val_a,
+                                    const char *enum_b, uint64_t *val_b) {
+  drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+  if (!props)
+    return;
+
+  for (uint32_t i = 0; i < props->count_props; i++) {
+    drmModePropertyPtr prop = drmModeGetProperty(fd, props->props[i]);
+    if (!prop)
+      continue;
+
+    if (strcmp(prop->name, prop_name) == 0) {
+      *prop_id = prop->prop_id;
+      for (int e = 0; e < prop->count_enums; e++) {
+        if (strcmp(prop->enums[e].name, enum_a) == 0)
+          *val_a = prop->enums[e].value;
+        else if (strcmp(prop->enums[e].name, enum_b) == 0)
+          *val_b = prop->enums[e].value;
+      }
+      drmModeFreeProperty(prop);
+      drmModeFreeObjectProperties(props);
+      return;
+    }
+    drmModeFreeProperty(prop);
+  }
+
+  drmModeFreeObjectProperties(props);
 }
 
 static int open_vc4_drm_device(void) {
@@ -77,6 +118,8 @@ static int open_vc4_drm_device(void) {
 }
 
 void v4l2_drm_update_geometry(struct v4l2_ctx *ctx) {
+  ctx->plane_needs_full_props = true;
+
   if (ctx->crtc_width <= 0 || ctx->crtc_height <= 0 ||
       ctx->visible_width <= 0 || ctx->visible_height <= 0) {
     ctx->dst_x = 0;
@@ -100,6 +143,24 @@ void v4l2_drm_update_geometry(struct v4l2_ctx *ctx) {
     ctx->dst_x = 0;
     ctx->dst_y = (ctx->crtc_height - ctx->dst_h) / 2;
   }
+}
+
+void v4l2_drm_set_colorspace(struct v4l2_ctx *ctx, uint32_t v4l2_colorspace, uint32_t v4l2_quantization) {
+  if (v4l2_colorspace == V4L2_COLORSPACE_SMPTE170M ||
+      v4l2_colorspace == V4L2_COLORSPACE_470_SYSTEM_M ||
+      v4l2_colorspace == V4L2_COLORSPACE_470_SYSTEM_BG) {
+    ctx->color_encoding = ctx->val_color_encoding_bt601;
+  } else {
+    ctx->color_encoding = ctx->val_color_encoding_bt709;
+  }
+
+  if (v4l2_quantization == V4L2_QUANTIZATION_FULL_RANGE) {
+    ctx->color_range = ctx->val_color_range_full;
+  } else {
+    ctx->color_range = ctx->val_color_range_limited;
+  }
+
+  ctx->plane_needs_full_props = true;
 }
 
 int v4l2_drm_init(struct v4l2_ctx *ctx) {
@@ -175,10 +236,9 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
   ctx->crtc_id = crtc_id;
 
   drmModeCrtcPtr crtc = drmModeGetCrtc(ctx->drm_fd, ctx->crtc_id);
-  if (crtc) {
+  if (crtc && crtc->mode_valid && crtc->width > 0 && crtc->height > 0) {
     ctx->crtc_width = crtc->width;
     ctx->crtc_height = crtc->height;
-    drmModeFreeCrtc(crtc);
   } else if (conn->count_modes > 0) {
     ctx->crtc_width = conn->modes[0].hdisplay;
     ctx->crtc_height = conn->modes[0].vdisplay;
@@ -186,6 +246,8 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
     ctx->crtc_width = 1920;
     ctx->crtc_height = 1080;
   }
+  if (crtc)
+    drmModeFreeCrtc(crtc);
 
   drmModeFreeConnector(conn);
 
@@ -205,7 +267,7 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
     return -1;
   }
 
-  /* Find an overlay or primary plane connected to this CRTC supporting NV12 */
+  /* Prefer a primary plane connected to this CRTC supporting NV12; fallback to overlay */
   drmModePlaneResPtr plane_res = drmModeGetPlaneResources(ctx->drm_fd);
   if (!plane_res) {
     perror("drmModeGetPlaneResources failed");
@@ -215,7 +277,8 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
     return -1;
   }
 
-  uint32_t selected_plane = 0;
+  uint32_t primary_plane = 0;
+  uint32_t fallback_plane = 0;
   for (uint32_t i = 0; i < plane_res->count_planes; i++) {
     drmModePlanePtr plane = drmModeGetPlane(ctx->drm_fd, plane_res->planes[i]);
     if (!plane)
@@ -227,16 +290,27 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
       continue;
     }
 
+    bool has_nv12 = false;
     for (uint32_t j = 0; j < plane->count_formats; j++) {
       if (plane->formats[j] == DRM_FORMAT_NV12) {
-        selected_plane = plane->plane_id;
+        has_nv12 = true;
         break;
       }
     }
+
+    uint32_t pid = plane->plane_id;
     drmModeFreePlane(plane);
-    if (selected_plane != 0)
-      break;
+
+    if (has_nv12) {
+      if (get_plane_type(ctx->drm_fd, pid) == DRM_PLANE_TYPE_PRIMARY) {
+        primary_plane = pid;
+        break;
+      }
+      if (fallback_plane == 0)
+        fallback_plane = pid;
+    }
   }
+  uint32_t selected_plane = (primary_plane != 0) ? primary_plane : fallback_plane;
 
   drmModeFreePlaneResources(plane_res);
   drmModeFreeResources(res);
@@ -250,22 +324,41 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
 
   ctx->plane_id = selected_plane;
 
-  /* Cache atomic plane properties */
-  if (get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID", &ctx->prop_fb_id) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID", &ctx->prop_crtc_id) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_X", &ctx->prop_crtc_x) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_Y", &ctx->prop_crtc_y) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_W", &ctx->prop_crtc_w) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_H", &ctx->prop_crtc_h) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_X", &ctx->prop_src_x) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_Y", &ctx->prop_src_y) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_W", &ctx->prop_src_w) != 0 ||
-      get_property_id(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_H", &ctx->prop_src_h) != 0) {
+  /* Cache atomic plane properties and snapshot initial plane state for exit restoration */
+  if (get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID", &ctx->prop_fb_id, &ctx->orig_fb_id) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID", &ctx->prop_crtc_id, &ctx->orig_crtc_id) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_X", &ctx->prop_crtc_x, &ctx->orig_crtc_x) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_Y", &ctx->prop_crtc_y, &ctx->orig_crtc_y) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_W", &ctx->prop_crtc_w, &ctx->orig_crtc_w) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_H", &ctx->prop_crtc_h, &ctx->orig_crtc_h) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_X", &ctx->prop_src_x, &ctx->orig_src_x) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_Y", &ctx->prop_src_y, &ctx->orig_src_y) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_W", &ctx->prop_src_w, &ctx->orig_src_w) != 0 ||
+      get_property_info(ctx->drm_fd, ctx->plane_id, DRM_MODE_OBJECT_PLANE, "SRC_H", &ctx->prop_src_h, &ctx->orig_src_h) != 0) {
     fprintf(stderr, "V4L2 DRM: Required atomic properties missing on plane %u\n", ctx->plane_id);
     close(ctx->drm_fd);
     ctx->drm_fd = -1;
     return -1;
   }
+
+  ctx->prop_color_encoding = 0;
+  ctx->prop_color_range = 0;
+  ctx->val_color_encoding_bt601 = UINT64_MAX;
+  ctx->val_color_encoding_bt709 = UINT64_MAX;
+  ctx->val_color_range_limited = UINT64_MAX;
+  ctx->val_color_range_full = UINT64_MAX;
+  get_color_enum_property(ctx->drm_fd, ctx->plane_id, "COLOR_ENCODING", &ctx->prop_color_encoding,
+                          "ITU-R BT.601 YCbCr", &ctx->val_color_encoding_bt601,
+                          "ITU-R BT.709 YCbCr", &ctx->val_color_encoding_bt709);
+  get_color_enum_property(ctx->drm_fd, ctx->plane_id, "COLOR_RANGE", &ctx->prop_color_range,
+                          "YCbCr limited range", &ctx->val_color_range_limited,
+                          "YCbCr full range", &ctx->val_color_range_full);
+  ctx->color_encoding = ctx->val_color_encoding_bt709;
+  ctx->color_range = ctx->val_color_range_limited;
+
+  ctx->atomic_req = drmModeAtomicAlloc();
+  ctx->plane_needs_full_props = true;
+  ctx->orig_plane_restored = false;
 
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
@@ -283,8 +376,12 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
 
 void v4l2_drm_destroy(struct v4l2_ctx *ctx) {
   if (ctx->drm_fd >= 0) {
-    v4l2_drm_disable_plane_sync(ctx);
+    v4l2_drm_restore_plane_sync(ctx);
     v4l2_drm_release_capture_buffers(ctx);
+    if (ctx->atomic_req) {
+      drmModeAtomicFree(ctx->atomic_req);
+      ctx->atomic_req = NULL;
+    }
     close(ctx->drm_fd);
     ctx->drm_fd = -1;
   }
@@ -340,32 +437,49 @@ void v4l2_drm_release_capture_buffers(struct v4l2_ctx *ctx) {
 }
 
 static int commit_atomic_flip(struct v4l2_ctx *ctx, int buf_idx) {
-  drmModeAtomicReqPtr req = drmModeAtomicAlloc();
-  if (!req)
-    return -1;
+  drmModeAtomicReqPtr req = ctx->atomic_req;
+  bool temp_req = false;
+  if (req) {
+    drmModeAtomicSetCursor(req, 0);
+  } else {
+    req = drmModeAtomicAlloc();
+    if (!req)
+      return -1;
+    temp_req = true;
+  }
 
   uint32_t fb_id = ctx->capture_bufs[buf_idx].fb_id;
-
   drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_fb_id, fb_id);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_id, ctx->crtc_id);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_x, ctx->dst_x);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_y, ctx->dst_y);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_w, ctx->dst_w);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_h, ctx->dst_h);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_x, 0);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_y, 0);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_w, ctx->visible_width << 16);
-  drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_h, ctx->visible_height << 16);
+
+  if (ctx->plane_needs_full_props) {
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_id, ctx->crtc_id);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_x, ctx->dst_x);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_y, ctx->dst_y);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_w, ctx->dst_w);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_h, ctx->dst_h);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_x, 0);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_y, 0);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_w, (uint64_t)ctx->visible_width << 16);
+    drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_h, (uint64_t)ctx->visible_height << 16);
+    if (ctx->prop_color_encoding != 0 && ctx->color_encoding != UINT64_MAX)
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_color_encoding, ctx->color_encoding);
+    if (ctx->prop_color_range != 0 && ctx->color_range != UINT64_MAX)
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_color_range, ctx->color_range);
+  }
 
   uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
   int ret = drmModeAtomicCommit(ctx->drm_fd, req, flags, ctx);
-  if (ret != 0) {
+  if (ret == 0) {
+    ctx->plane_needs_full_props = false;
+  } else {
     static int flip_err_count = 0;
     if (flip_err_count++ < 10) {
       fprintf(stderr, "V4L2 DRM: drmModeAtomicCommit failed: %d (%s)\n", ret, strerror(errno));
     }
   }
-  drmModeAtomicFree(req);
+
+  if (temp_req)
+    drmModeAtomicFree(req);
 
   return ret;
 }
@@ -406,7 +520,10 @@ void v4l2_drm_drain_pending_flip(struct v4l2_ctx *ctx) {
   evctx.version = DRM_EVENT_CONTEXT_VERSION;
   evctx.page_flip_handler = v4l2_drm_page_flip_handler;
 
+  pthread_mutex_lock(&ctx->drm_lock);
   while (ctx->flip_pending) {
+    pthread_mutex_unlock(&ctx->drm_lock);
+
     struct pollfd pfd;
     pfd.fd = ctx->drm_fd;
     pfd.events = POLLIN;
@@ -414,11 +531,14 @@ void v4l2_drm_drain_pending_flip(struct v4l2_ctx *ctx) {
     int ret = poll(&pfd, 1, 100);
     if (ret > 0 && (pfd.revents & POLLIN)) {
       drmHandleEvent(ctx->drm_fd, &evctx);
+      pthread_mutex_lock(&ctx->drm_lock);
     } else {
+      pthread_mutex_lock(&ctx->drm_lock);
       ctx->flip_pending = false;
       break;
     }
   }
+  pthread_mutex_unlock(&ctx->drm_lock);
 }
 
 void v4l2_drm_disable_plane_sync(struct v4l2_ctx *ctx) {
@@ -434,6 +554,41 @@ void v4l2_drm_disable_plane_sync(struct v4l2_ctx *ctx) {
 
   drmModeAtomicCommit(ctx->drm_fd, req, 0, NULL);
   drmModeAtomicFree(req);
+  ctx->plane_needs_full_props = true;
+}
+
+void v4l2_drm_restore_plane_sync(struct v4l2_ctx *ctx) {
+  if (ctx->drm_fd < 0 || ctx->plane_id == 0)
+    return;
+
+  if (ctx->orig_fb_id != 0 && ctx->orig_crtc_id != 0) {
+    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+    if (req) {
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_fb_id, ctx->orig_fb_id);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_id, ctx->orig_crtc_id);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_x, ctx->orig_crtc_x);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_y, ctx->orig_crtc_y);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_w, ctx->orig_crtc_w);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_h, ctx->orig_crtc_h);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_x, ctx->orig_src_x);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_y, ctx->orig_src_y);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_w, ctx->orig_src_w);
+      drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_h, ctx->orig_src_h);
+
+      int ret = drmModeAtomicCommit(ctx->drm_fd, req, 0, NULL);
+      drmModeAtomicFree(req);
+      ctx->orig_fb_id = 0;
+      ctx->plane_needs_full_props = true;
+      if (ret == 0) {
+        ctx->orig_plane_restored = true;
+        return;
+      }
+    }
+  }
+
+  if (!ctx->orig_plane_restored) {
+    v4l2_drm_disable_plane_sync(ctx);
+  }
 }
 
 void v4l2_drm_page_flip_handler(int fd, unsigned int seq, unsigned int tv_sec,

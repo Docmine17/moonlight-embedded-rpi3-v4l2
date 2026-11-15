@@ -45,14 +45,14 @@ This document tracks the phased implementation of build/packaging tooling, bitst
 ## Phase 3: DRM/KMS Presentation, Plane State Restoration & VBlank Optimization
 *Goal: Eliminate stale frame presentation on VBlank boundaries, reduce per-flip atomic ioctl overhead, and cleanly restore the Linux console (`fbcon`) on exit.*
 
-- [ ] **Drain Decoded Capture Frames Before DRM VBlank Events** (`src/video/v4l2.c`)
+- [x] **Drain Decoded Capture Frames Before DRM VBlank Events** (`src/video/v4l2.c`)
   - Process `CAPTURE_MPLANE` (`VIDIOC_DQBUF`) before `drmHandleEvent()` in `v4l2_event_thread` so newly decoded frames are staged in time for a simultaneous VBlank wakeup.
   - Skip empty/error buffers (`bytesused == 0`, `V4L2_BUF_FLAG_ERROR`, `V4L2_BUF_FLAG_LAST`) and when multiple decoded frames dequeue in one burst, immediately requeue intermediate frames and present only the freshest frame.
-- [ ] **Primary Plane Selection, Console Restoration & Fast Atomic Commits** (`src/video/v4l2.h`, `src/video/v4l2_drm.c`, `src/video/v4l2_codec.c`, `src/platform.c`)
-  - Prefer `DRM_PLANE_TYPE_PRIMARY` supporting `DRM_FORMAT_NV12`, save initial plane/CRTC properties (`FB_ID`, `CRTC_ID`, geometry) in `v4l2_drm_init()`, and restore them in `v4l2_drm_destroy()` so `fbcon` recovers on exit.
+- [x] **Primary Plane Selection, Console Restoration & Fast Atomic Commits** (`src/video/v4l2.h`, `src/video/v4l2_drm.h`, `src/video/v4l2_drm.c`, `src/video/v4l2_codec.c`, `src/platform.c`, `src/main.c`)
+  - Prefer `DRM_PLANE_TYPE_PRIMARY` supporting `DRM_FORMAT_NV12`, save initial plane/CRTC properties (`FB_ID`, `CRTC_ID`, geometry) in `v4l2_drm_init()`, and restore them on exit via `v4l2_drm_restore_plane_sync()` so `fbcon` recovers cleanly.
   - Only call `v4l2_drm_disable_plane_sync()` during `v4l2_codec_handle_drc()` when `ctx->capture_streaming` is already active (saving 16.67 ms on initial stream startup).
   - Pre-allocate `drmModeAtomicReqPtr` using `drmModeAtomicSetCursor(req, 0)` and track `plane_needs_full_props` so steady-state page flips only update `FB_ID`.
-  - Support optional `COLOR_ENCODING` (`BT.709` / `BT.601`) and `COLOR_RANGE` (`Limited` / `Full`) plane properties and blank `/sys/class/graphics/fb0/blank` during streaming.
+  - Support optional `COLOR_ENCODING` (`BT.709` / `BT.601`) and `COLOR_RANGE` (`Limited` / `Full`) plane properties, unblank `/sys/class/graphics/fb0/blank` on start/stop, and list `v4l2` in `-platform` CLI help.
 
 ---
 

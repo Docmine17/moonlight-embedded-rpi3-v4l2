@@ -82,12 +82,7 @@ static void *v4l2_event_thread(void *arg) {
     if (ret <= 0)
       continue;
 
-    /* 1. Handle DRM VBlank page-flip events */
-    if (pfd[1].revents & POLLIN) {
-      drmHandleEvent(ctx->drm_fd, &evctx);
-    }
-
-    /* 2. Handle V4L2 Dynamic Resolution / Format Change */
+    /* 1. Handle V4L2 Dynamic Resolution / Format Change */
     if (pfd[0].revents & POLLPRI) {
       struct v4l2_event ev;
       memset(&ev, 0, sizeof(ev));
@@ -99,8 +94,9 @@ static void *v4l2_event_thread(void *arg) {
       }
     }
 
-    /* 3. Handle newly decoded frames ready for display (drain all ready frames) */
+    /* 2. Drain decoded capture frames before VBlank so freshest frame stages in time */
     if (pfd[0].revents & POLLIN) {
+      int newest_idx = -1;
       struct v4l2_plane planes[1];
       struct v4l2_buffer buf;
       memset(&buf, 0, sizeof(buf));
@@ -111,7 +107,16 @@ static void *v4l2_event_thread(void *arg) {
       buf.m.planes = planes;
 
       while (ioctl(ctx->v4l2_fd, VIDIOC_DQBUF, &buf) == 0) {
-        v4l2_drm_present(ctx, buf.index);
+        if ((buf.flags & V4L2_BUF_FLAG_ERROR) || buf.m.planes[0].bytesused == 0) {
+          if (!(buf.flags & V4L2_BUF_FLAG_LAST)) {
+            v4l2_codec_requeue_capture(ctx, buf.index);
+          }
+        } else {
+          if (newest_idx != -1) {
+            v4l2_codec_requeue_capture(ctx, newest_idx);
+          }
+          newest_idx = (int)buf.index;
+        }
 
         memset(&buf, 0, sizeof(buf));
         memset(planes, 0, sizeof(planes));
@@ -120,6 +125,15 @@ static void *v4l2_event_thread(void *arg) {
         buf.length = 1;
         buf.m.planes = planes;
       }
+
+      if (newest_idx != -1) {
+        v4l2_drm_present(ctx, newest_idx);
+      }
+    }
+
+    /* 3. Handle DRM VBlank page-flip events */
+    if (pfd[1].revents & POLLIN) {
+      drmHandleEvent(ctx->drm_fd, &evctx);
     }
   }
 
@@ -199,8 +213,8 @@ static void v4l2_cleanup(void) {
   /* 1. Drain pending page flips before releasing buffers */
   v4l2_drm_drain_pending_flip(&v4l2_instance);
 
-  /* 2. Synchronously disable plane scanout */
-  v4l2_drm_disable_plane_sync(&v4l2_instance);
+  /* 2. Synchronously restore console plane scanout (or disable if none was saved) */
+  v4l2_drm_restore_plane_sync(&v4l2_instance);
 
   /* 3. Destroy DRM framebuffers, GEM handles, and DMABUF export FDs */
   v4l2_drm_release_capture_buffers(&v4l2_instance);

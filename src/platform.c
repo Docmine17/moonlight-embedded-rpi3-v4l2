@@ -133,6 +133,11 @@ void platform_start(enum platform system) {
     write_bool("/sys/class/graphics/fb0/blank", true);
     break;
   #endif
+  #ifdef HAVE_V4L2
+  case V4L2:
+    write_bool("/sys/class/graphics/fb0/blank", false);
+    break;
+  #endif
   }
 }
 
@@ -146,6 +151,11 @@ void platform_stop(enum platform system) {
   #endif
   #if defined(HAVE_PI) || defined(HAVE_MMAL)
   case PI:
+    write_bool("/sys/class/graphics/fb0/blank", false);
+    break;
+  #endif
+  #ifdef HAVE_V4L2
+  case V4L2:
     write_bool("/sys/class/graphics/fb0/blank", false);
     break;
   #endif

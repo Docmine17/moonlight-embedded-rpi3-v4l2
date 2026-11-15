@@ -302,15 +302,20 @@ int v4l2_codec_queue_output_buffer(struct v4l2_ctx *ctx, int index, size_t bytes
 }
 
 int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
-  /* 1. Drain pending page flips and detach DRM plane synchronously */
-  v4l2_drm_drain_pending_flip(ctx);
+  /* 1. Drain pending page flips and detach DRM plane only if capture was active */
+  if (ctx->capture_streaming) {
+    v4l2_drm_drain_pending_flip(ctx);
+  }
 
   pthread_mutex_lock(&ctx->drm_lock);
-  v4l2_drm_disable_plane_sync(ctx);
+  if (ctx->capture_streaming) {
+    v4l2_drm_disable_plane_sync(ctx);
+  }
   ctx->flip_pending = false;
   ctx->current_displayed_idx = -1;
   ctx->pending_flip_idx = -1;
   ctx->staged_frame_idx = -1;
+  ctx->plane_needs_full_props = true;
   pthread_mutex_unlock(&ctx->drm_lock);
 
   /* 2. If capture queue was active, drain it and stop */
@@ -364,6 +369,7 @@ int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
   ctx->coded_width = gfmt.fmt.pix_mp.width;
   ctx->coded_height = gfmt.fmt.pix_mp.height;
   ctx->stride = gfmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+  v4l2_drm_set_colorspace(ctx, gfmt.fmt.pix_mp.colorspace, gfmt.fmt.pix_mp.quantization);
 
   /* 4. Query visible crop selection */
   struct v4l2_selection sel;
