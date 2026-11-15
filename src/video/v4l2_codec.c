@@ -57,6 +57,19 @@ static int open_bcm2835_decoder_device(void) {
 }
 
 int v4l2_codec_init(struct v4l2_ctx *ctx) {
+  for (int i = 0; i < V4L2_MAX_OUTPUT_BUFFERS; i++) {
+    ctx->output_bufs[i].start = NULL;
+    ctx->output_bufs[i].length = 0;
+    ctx->output_bufs[i].export_fd = -1;
+    ctx->output_bufs[i].queued = false;
+  }
+  for (int i = 0; i < V4L2_MAX_CAPTURE_BUFFERS; i++) {
+    ctx->capture_bufs[i].export_fd = -1;
+    ctx->capture_bufs[i].gem_handle = 0;
+    ctx->capture_bufs[i].fb_id = 0;
+    ctx->capture_bufs[i].queued = false;
+  }
+
   ctx->v4l2_fd = open_bcm2835_decoder_device();
   if (ctx->v4l2_fd < 0) {
     perror("Can't open bcm2835 decoder device");
@@ -69,9 +82,7 @@ int v4l2_codec_init(struct v4l2_ctx *ctx) {
   sub.type = V4L2_EVENT_SOURCE_CHANGE;
   if (ioctl(ctx->v4l2_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) != 0) {
     perror("VIDIOC_SUBSCRIBE_EVENT failed");
-    close(ctx->v4l2_fd);
-    ctx->v4l2_fd = -1;
-    return -1;
+    goto err_close;
   }
 
   /* 2. Configure OUTPUT_MPLANE with placeholder geometry to ensure SOURCE_CHANGE fires */
@@ -86,25 +97,23 @@ int v4l2_codec_init(struct v4l2_ctx *ctx) {
 
   if (ioctl(ctx->v4l2_fd, VIDIOC_S_FMT, &fmt) != 0) {
     perror("VIDIOC_S_FMT on OUTPUT_MPLANE failed");
-    close(ctx->v4l2_fd);
-    ctx->v4l2_fd = -1;
-    return -1;
+    goto err_close;
   }
 
-  /* 3. Allocate 12 OUTPUT buffers to guarantee smooth non-blocking feeding */
+  /* 3. Allocate short OUTPUT queue (4 buffers) to eliminate queue bufferbloat */
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
-  req.count = 12;
+  req.count = V4L2_MAX_OUTPUT_BUFFERS;
   req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
   req.memory = V4L2_MEMORY_MMAP;
 
   if (ioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) != 0 || req.count == 0) {
     perror("VIDIOC_REQBUFS on OUTPUT_MPLANE failed");
-    close(ctx->v4l2_fd);
-    ctx->v4l2_fd = -1;
-    return -1;
+    goto err_close;
   }
-  ctx->num_output_bufs = req.count;
+  ctx->num_output_bufs = (req.count > V4L2_MAX_OUTPUT_BUFFERS)
+                           ? V4L2_MAX_OUTPUT_BUFFERS
+                           : (int)req.count;
 
   for (int i = 0; i < ctx->num_output_bufs; i++) {
     struct v4l2_plane planes[1];
@@ -119,9 +128,7 @@ int v4l2_codec_init(struct v4l2_ctx *ctx) {
 
     if (ioctl(ctx->v4l2_fd, VIDIOC_QUERYBUF, &buf) != 0) {
       perror("VIDIOC_QUERYBUF on OUTPUT_MPLANE failed");
-      close(ctx->v4l2_fd);
-      ctx->v4l2_fd = -1;
-      return -1;
+      goto err_unmap;
     }
 
     ctx->output_bufs[i].length = buf.m.planes[0].length;
@@ -129,10 +136,9 @@ int v4l2_codec_init(struct v4l2_ctx *ctx) {
                                      PROT_READ | PROT_WRITE, MAP_SHARED,
                                      ctx->v4l2_fd, buf.m.planes[0].m.mem_offset);
     if (ctx->output_bufs[i].start == MAP_FAILED) {
+      ctx->output_bufs[i].start = NULL;
       perror("mmap on OUTPUT_MPLANE failed");
-      close(ctx->v4l2_fd);
-      ctx->v4l2_fd = -1;
-      return -1;
+      goto err_unmap;
     }
     ctx->output_bufs[i].queued = false;
   }
@@ -140,13 +146,31 @@ int v4l2_codec_init(struct v4l2_ctx *ctx) {
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
   if (ioctl(ctx->v4l2_fd, VIDIOC_STREAMON, &type) != 0) {
     perror("VIDIOC_STREAMON on OUTPUT_MPLANE failed");
-    close(ctx->v4l2_fd);
-    ctx->v4l2_fd = -1;
-    return -1;
+    goto err_unmap;
   }
   ctx->output_streaming = true;
 
   return 0;
+
+err_unmap:
+  for (int i = 0; i < ctx->num_output_bufs; i++) {
+    if (ctx->output_bufs[i].start && ctx->output_bufs[i].start != MAP_FAILED) {
+      munmap(ctx->output_bufs[i].start, ctx->output_bufs[i].length);
+      ctx->output_bufs[i].start = NULL;
+    }
+  }
+  ctx->num_output_bufs = 0;
+  struct v4l2_requestbuffers req0;
+  memset(&req0, 0, sizeof(req0));
+  req0.count = 0;
+  req0.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+  req0.memory = V4L2_MEMORY_MMAP;
+  ioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req0);
+
+err_close:
+  close(ctx->v4l2_fd);
+  ctx->v4l2_fd = -1;
+  return -1;
 }
 
 void v4l2_codec_destroy(struct v4l2_ctx *ctx) {
@@ -196,87 +220,84 @@ void v4l2_codec_destroy(struct v4l2_ctx *ctx) {
   ctx->v4l2_fd = -1;
 }
 
-int v4l2_codec_feed_packet(struct v4l2_ctx *ctx, const uint8_t *data, size_t length) {
-  /* 1. Drain finished output buffers in a non-blocking loop */
-  struct v4l2_plane planes[1];
-  struct v4l2_buffer buf;
-  memset(&buf, 0, sizeof(buf));
-  memset(planes, 0, sizeof(planes));
-  buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-  buf.memory = V4L2_MEMORY_MMAP;
-  buf.length = 1;
-  buf.m.planes = planes;
+/* Caller must hold ctx->state_mutex; lock is temporarily dropped while polling. */
+int v4l2_codec_acquire_output_buffer(struct v4l2_ctx *ctx, int timeout_ms) {
+  int waited_ms = 0;
 
-  int free_idx = -1;
+  while (1) {
+    if (!atomic_load(&ctx->running) || !atomic_load(&ctx->streaming) ||
+        ctx->v4l2_fd < 0 || !ctx->output_streaming) {
+      return -ECANCELED;
+    }
 
-  /* Drain finished output buffers and find an available slot.
-   * If all buffers are in flight, wait briefly (up to 12ms total) for the hardware
-   * to release one instead of immediately dropping or causing an IDR cascade. */
-  for (int attempt = 0; attempt < 4; attempt++) {
-    memset(&buf, 0, sizeof(buf));
-    memset(planes, 0, sizeof(planes));
-    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.length = 1;
-    buf.m.planes = planes;
-
-    while (ioctl(ctx->v4l2_fd, VIDIOC_DQBUF, &buf) == 0) {
-      if ((int)buf.index < ctx->num_output_bufs) {
-        ctx->output_bufs[buf.index].queued = false;
-      }
+    /* 1. Drain finished output buffers in a non-blocking loop */
+    struct v4l2_plane planes[1];
+    struct v4l2_buffer buf;
+    while (1) {
       memset(&buf, 0, sizeof(buf));
       memset(planes, 0, sizeof(planes));
       buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.length = 1;
       buf.m.planes = planes;
+
+      if (ioctl(ctx->v4l2_fd, VIDIOC_DQBUF, &buf) != 0)
+        break;
+
+      if ((int)buf.index < ctx->num_output_bufs) {
+        ctx->output_bufs[buf.index].queued = false;
+      }
     }
 
     for (int i = 0; i < ctx->num_output_bufs; i++) {
       if (!ctx->output_bufs[i].queued) {
-        free_idx = i;
-        break;
+        return i;
       }
     }
 
-    if (free_idx >= 0)
-      break;
+    if (waited_ms >= timeout_ms) {
+      return -EBUSY;
+    }
 
-    /* Wait up to 3ms for decoder to finish an output buffer */
+    /* Drop state_mutex around poll() so v4l2_cleanup() and other callers are never blocked */
+    int fd = ctx->v4l2_fd;
+    pthread_mutex_unlock(&ctx->state_mutex);
+
     struct pollfd pfd;
-    pfd.fd = ctx->v4l2_fd;
+    pfd.fd = fd;
     pfd.events = POLLOUT;
     pfd.revents = 0;
     poll(&pfd, 1, 3);
-  }
+    waited_ms += 3;
 
-  if (free_idx < 0) {
-    /* No buffer immediately available after waiting */
-    return -EBUSY;
+    pthread_mutex_lock(&ctx->state_mutex);
   }
+}
 
-  if (length > ctx->output_bufs[free_idx].length) {
-    fprintf(stderr, "Bitstream packet too large (%zu > %zu)\n", length, ctx->output_bufs[free_idx].length);
+/* Caller must hold ctx->state_mutex. */
+int v4l2_codec_queue_output_buffer(struct v4l2_ctx *ctx, int index, size_t bytesused) {
+  if (index < 0 || index >= ctx->num_output_bufs ||
+      ctx->v4l2_fd < 0 || !ctx->output_streaming) {
     return -EINVAL;
   }
 
-  memcpy(ctx->output_bufs[free_idx].start, data, length);
-
+  struct v4l2_plane planes[1];
+  struct v4l2_buffer buf;
   memset(&buf, 0, sizeof(buf));
   memset(planes, 0, sizeof(planes));
   buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
   buf.memory = V4L2_MEMORY_MMAP;
-  buf.index = free_idx;
+  buf.index = index;
   buf.length = 1;
   buf.m.planes = planes;
-  buf.m.planes[0].bytesused = length;
+  buf.m.planes[0].bytesused = bytesused;
 
   if (ioctl(ctx->v4l2_fd, VIDIOC_QBUF, &buf) != 0) {
     perror("VIDIOC_QBUF on OUTPUT_MPLANE failed");
     return -errno;
   }
 
-  ctx->output_bufs[free_idx].queued = true;
+  ctx->output_bufs[index].queued = true;
   return 0;
 }
 
@@ -361,7 +382,7 @@ int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
 
   v4l2_drm_update_geometry(ctx);
 
-  /* 5. Query min buffers for capture and request allocation */
+  /* 5. Query min buffers for capture and allocate tight DPB + DRM staging cushion */
   struct v4l2_control ctrl;
   memset(&ctrl, 0, sizeof(ctrl));
   ctrl.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
@@ -370,11 +391,18 @@ int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
     min_bufs = ctrl.value;
   }
 
-  int req_count = min_bufs + 8; /* DPB reference frames + DRM display queue cushion */
-  if (req_count < 12)
-    req_count = 12;
+  int req_count = min_bufs + 3; /* DPB refs + scanout + staged + next decode slot */
+  if (req_count < 5)
+    req_count = 5;
   if (req_count > V4L2_MAX_CAPTURE_BUFFERS)
     req_count = V4L2_MAX_CAPTURE_BUFFERS;
+
+  for (int i = 0; i < V4L2_MAX_CAPTURE_BUFFERS; i++) {
+    ctx->capture_bufs[i].export_fd = -1;
+    ctx->capture_bufs[i].gem_handle = 0;
+    ctx->capture_bufs[i].fb_id = 0;
+    ctx->capture_bufs[i].queued = false;
+  }
 
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
@@ -386,7 +414,9 @@ int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
     perror("VIDIOC_REQBUFS on CAPTURE_MPLANE failed");
     return -1;
   }
-  ctx->num_capture_bufs = req.count;
+  ctx->num_capture_bufs = (req.count > V4L2_MAX_CAPTURE_BUFFERS)
+                            ? V4L2_MAX_CAPTURE_BUFFERS
+                            : (int)req.count;
 
   /* 6. Export DMABUF, import to DRM, and queue each capture buffer */
   for (int i = 0; i < ctx->num_capture_bufs; i++) {

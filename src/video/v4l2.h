@@ -25,12 +25,13 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <linux/videodev2.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#define V4L2_MAX_OUTPUT_BUFFERS 16
+#define V4L2_MAX_OUTPUT_BUFFERS 4
 #define V4L2_MAX_CAPTURE_BUFFERS 20
 #define V4L2_OUTPUT_BUFFER_SIZE (1024 * 1024) /* 1 MB buffer for high-bitrate I-frames */
 
@@ -100,13 +101,9 @@ struct v4l2_ctx {
 
   /* Threading & lifecycle */
   pthread_mutex_t state_mutex;
-  bool running;
-  bool streaming;
+  atomic_bool running;
+  atomic_bool streaming;
   pthread_t event_thread;
-
-  /* Bitstream staging buffer */
-  uint8_t *bitstream_buf;
-  size_t bitstream_buf_size;
 };
 
 #endif /* VIDEO_V4L2_H */

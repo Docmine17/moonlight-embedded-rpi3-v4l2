@@ -25,7 +25,8 @@
 int v4l2_codec_init(struct v4l2_ctx *ctx);
 void v4l2_codec_destroy(struct v4l2_ctx *ctx);
 
-int v4l2_codec_feed_packet(struct v4l2_ctx *ctx, const uint8_t *data, size_t length);
+int v4l2_codec_acquire_output_buffer(struct v4l2_ctx *ctx, int timeout_ms);
+int v4l2_codec_queue_output_buffer(struct v4l2_ctx *ctx, int index, size_t bytesused);
 int v4l2_codec_handle_drc(struct v4l2_ctx *ctx);
 void v4l2_codec_requeue_capture(struct v4l2_ctx *ctx, int index);
 

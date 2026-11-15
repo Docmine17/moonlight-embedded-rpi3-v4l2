@@ -24,19 +24,19 @@ This document tracks the phased implementation of build/packaging tooling, bitst
 ## Phase 2: H.264 SPS VUI Fixup & V4L2 Hot-Path Zero-Intermediate-Copy
 *Goal: Eliminate DPB frame reordering delays (up to 66–83 ms), cut V4L2 queue bufferbloat (~20 MB CMA saved), remove double CPU `memcpy` on every packet, and prevent `state_mutex` stalls.*
 
-- [ ] **Fix H.264 SPS VUI Low-Latency Patching** (`libgamestream/sps.c`)
+- [x] **Fix H.264 SPS VUI Low-Latency Patching** (`libgamestream/sps.c`)
   - Explicitly set `h264_stream->sps->vui_parameters_present_flag = 1`.
   - Force `num_reorder_frames = 0` and `max_dec_frame_buffering = 1` unconditionally even if the host encoder already sets `bitstream_restriction_flag = 1`.
   - Enable `low_delay_hrd_flag = 1` when HRD parameters (`nal_hrd_parameters_present_flag` or `vcl_hrd_parameters_present_flag`) are present.
   - Clamp `level_idc` by macroblock count (`<= 3600 -> 32`, `<= 8160 -> 42`) and unconditionally cap `level_idc <= 42` so Level 5.0 streams never fail on `bcm2835-codec`.
   - Increase `write_nal_unit()` buffer bound from `128` to `256` with error fallback and fix `h264_stream` re-init leak in `gs_sps_init()`.
-- [ ] **Set Single Slice Per Frame (`CAPABILITY_SLICES_PER_FRAME(1)`)** (`src/video/v4l2.c`)
+- [x] **Set Single Slice Per Frame (`CAPABILITY_SLICES_PER_FRAME(1)`)** (`src/video/v4l2.c`)
   - Replace `CAPABILITY_SLICES_PER_FRAME(4)` with `CAPABILITY_SLICES_PER_FRAME(1)` to avoid redundant slice headers and CABAC context resets per frame on VideoCore IV.
-- [ ] **Eliminate Intermediate `bitstream_buf` Copy & Mutex Poll Contention** (`src/video/v4l2.h`, `src/video/v4l2.c`, `src/video/v4l2_codec.h`, `src/video/v4l2_codec.c`)
+- [x] **Eliminate Intermediate `bitstream_buf` Copy & Mutex Poll Contention** (`src/video/v4l2.h`, `src/video/v4l2.c`, `src/video/v4l2_codec.h`, `src/video/v4l2_codec.c`)
   - Acquire a free `OUTPUT_MPLANE` mmap buffer slot first, assemble `decodeUnit->bufferList` NALUs and `gs_sps_fix()` directly into `ctx->output_bufs[idx].start` with strict bounds checking, and enqueue via `VIDIOC_QBUF`.
   - Avoid holding `state_mutex` while polling `v4l2_fd` for `POLLOUT`, using `<stdatomic.h>` (`atomic_bool running`, `atomic_bool streaming`) and allowing a longer initial wait (up to 50 ms) during initial DRC (`!ctx->capture_streaming` or `FRAME_TYPE_IDR`).
   - Return `DR_NEED_IDR` if an `FRAME_TYPE_IDR` unit is dropped or on fatal `-EINVAL`, while returning `DR_OK` on transient P-frame `-EBUSY` drops.
-- [ ] **Reduce V4L2 Queue Depths & Fix `export_fd` Initialization** (`src/video/v4l2.h`, `src/video/v4l2_codec.c`)
+- [x] **Reduce V4L2 Queue Depths & Fix `export_fd` Initialization** (`src/video/v4l2.h`, `src/video/v4l2_codec.c`)
   - Reduce `OUTPUT_MPLANE` buffers from `12` to `4` and `CAPTURE_MPLANE` buffers from `clamp(min_bufs + 8, 12, 20)` to `clamp(min_bufs + 3, 5, V4L2_MAX_CAPTURE_BUFFERS)`.
   - Initialize `v4l2_fd = -1`, `drm_fd = -1`, and all `export_fd = -1` prior to allocation to prevent closing `fd 0` (`stdin`) on partial error paths.
 

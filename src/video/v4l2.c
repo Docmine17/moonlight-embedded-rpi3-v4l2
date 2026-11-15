@@ -69,7 +69,7 @@ static void *v4l2_event_thread(void *arg) {
   evctx.version = DRM_EVENT_CONTEXT_VERSION;
   evctx.page_flip_handler = v4l2_drm_page_flip_handler;
 
-  while (ctx->running) {
+  while (atomic_load(&ctx->running)) {
     pfd[0].fd = ctx->v4l2_fd;
     pfd[0].events = POLLIN | POLLPRI;
     pfd[0].revents = 0;
@@ -133,6 +133,13 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
   }
 
   memset(&v4l2_instance, 0, sizeof(v4l2_instance));
+  v4l2_instance.v4l2_fd = -1;
+  v4l2_instance.drm_fd = -1;
+  for (int i = 0; i < V4L2_MAX_OUTPUT_BUFFERS; i++)
+    v4l2_instance.output_bufs[i].export_fd = -1;
+  for (int i = 0; i < V4L2_MAX_CAPTURE_BUFFERS; i++)
+    v4l2_instance.capture_bufs[i].export_fd = -1;
+
   v4l2_instance.stream_width = width;
   v4l2_instance.stream_height = height;
 
@@ -140,16 +147,8 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
 
   gs_sps_init(width, height);
 
-  v4l2_instance.bitstream_buf_size = INITIAL_DECODER_BUFFER_SIZE;
-  v4l2_instance.bitstream_buf = malloc(v4l2_instance.bitstream_buf_size);
-  if (!v4l2_instance.bitstream_buf) {
-    fprintf(stderr, "V4L2: Failed to allocate bitstream staging buffer\n");
-    return -1;
-  }
-
   if (v4l2_drm_init(&v4l2_instance) != 0) {
     fprintf(stderr, "V4L2: Failed to initialize DRM display engine\n");
-    free(v4l2_instance.bitstream_buf);
     pthread_mutex_destroy(&v4l2_instance.state_mutex);
     return -1;
   }
@@ -157,20 +156,19 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
   if (v4l2_codec_init(&v4l2_instance) != 0) {
     fprintf(stderr, "V4L2: Failed to initialize V4L2 M2M decoder\n");
     v4l2_drm_destroy(&v4l2_instance);
-    free(v4l2_instance.bitstream_buf);
     pthread_mutex_destroy(&v4l2_instance.state_mutex);
     return -1;
   }
 
-  v4l2_instance.running = true;
-  v4l2_instance.streaming = true;
+  atomic_store(&v4l2_instance.running, true);
+  atomic_store(&v4l2_instance.streaming, true);
 
   if (pthread_create(&v4l2_instance.event_thread, NULL, v4l2_event_thread, &v4l2_instance) != 0) {
     perror("V4L2: Failed to create event loop thread");
-    v4l2_instance.running = false;
+    atomic_store(&v4l2_instance.running, false);
+    atomic_store(&v4l2_instance.streaming, false);
     v4l2_codec_destroy(&v4l2_instance);
     v4l2_drm_destroy(&v4l2_instance);
-    free(v4l2_instance.bitstream_buf);
     pthread_mutex_destroy(&v4l2_instance.state_mutex);
     return -1;
   }
@@ -182,22 +180,16 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
 }
 
 static void v4l2_start(void) {
-  pthread_mutex_lock(&v4l2_instance.state_mutex);
-  v4l2_instance.streaming = true;
-  pthread_mutex_unlock(&v4l2_instance.state_mutex);
+  atomic_store(&v4l2_instance.streaming, true);
 }
 
 static void v4l2_stop(void) {
-  pthread_mutex_lock(&v4l2_instance.state_mutex);
-  v4l2_instance.streaming = false;
-  pthread_mutex_unlock(&v4l2_instance.state_mutex);
+  atomic_store(&v4l2_instance.streaming, false);
 }
 
 static void v4l2_cleanup(void) {
-  pthread_mutex_lock(&v4l2_instance.state_mutex);
-  v4l2_instance.running = false;
-  v4l2_instance.streaming = false;
-  pthread_mutex_unlock(&v4l2_instance.state_mutex);
+  atomic_store(&v4l2_instance.running, false);
+  atomic_store(&v4l2_instance.streaming, false);
 
   if (v4l2_instance.event_thread) {
     pthread_join(v4l2_instance.event_thread, NULL);
@@ -213,56 +205,76 @@ static void v4l2_cleanup(void) {
   /* 3. Destroy DRM framebuffers, GEM handles, and DMABUF export FDs */
   v4l2_drm_release_capture_buffers(&v4l2_instance);
 
-  /* 4. Destroy V4L2 decoder queues and release kernel buffers */
+  /* 4. Destroy V4L2 decoder queues and release kernel buffers under state_mutex
+   *    so any unblocked submit thread waking from poll() sees v4l2_fd < 0 cleanly. */
+  pthread_mutex_lock(&v4l2_instance.state_mutex);
   v4l2_codec_destroy(&v4l2_instance);
+  pthread_mutex_unlock(&v4l2_instance.state_mutex);
 
   /* 5. Destroy DRM resources and device */
   v4l2_drm_destroy(&v4l2_instance);
-
-  pthread_mutex_lock(&v4l2_instance.state_mutex);
-  if (v4l2_instance.bitstream_buf) {
-    free(v4l2_instance.bitstream_buf);
-    v4l2_instance.bitstream_buf = NULL;
-  }
-  pthread_mutex_unlock(&v4l2_instance.state_mutex);
 
   pthread_mutex_destroy(&v4l2_instance.state_mutex);
 }
 
 static int v4l2_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  if (!atomic_load(&v4l2_instance.streaming) || !atomic_load(&v4l2_instance.running)) {
+    return DR_OK;
+  }
+
   pthread_mutex_lock(&v4l2_instance.state_mutex);
-  if (!v4l2_instance.streaming || !v4l2_instance.running) {
+  if (!atomic_load(&v4l2_instance.streaming) || !atomic_load(&v4l2_instance.running)) {
     pthread_mutex_unlock(&v4l2_instance.state_mutex);
     return DR_OK;
   }
 
-  /* Ensure bitstream buffer can hold the entire NAL unit chain */
-  ensure_buf_size((void **)&v4l2_instance.bitstream_buf,
-                  &v4l2_instance.bitstream_buf_size,
-                  decodeUnit->fullLength + 256);
+  /* Allow extra wait during initial DRC or IDR frames so the first keyframe isn't dropped */
+  int timeout_ms = (decodeUnit->frameType == FRAME_TYPE_IDR || !v4l2_instance.capture_streaming) ? 51 : 12;
+  int buf_idx = v4l2_codec_acquire_output_buffer(&v4l2_instance, timeout_ms);
+  if (buf_idx < 0) {
+    pthread_mutex_unlock(&v4l2_instance.state_mutex);
+    /* Request IDR only when an IDR itself could not be queued; avoid IDR storms on transient P-frame drops */
+    return (decodeUnit->frameType == FRAME_TYPE_IDR) ? DR_NEED_IDR : DR_OK;
+  }
+
+  uint8_t *dst = (uint8_t *)v4l2_instance.output_bufs[buf_idx].start;
+  size_t cap = v4l2_instance.output_bufs[buf_idx].length;
+  if (!dst) {
+    pthread_mutex_unlock(&v4l2_instance.state_mutex);
+    return DR_NEED_IDR;
+  }
 
   uint32_t length = 0;
   PLENTRY entry = decodeUnit->bufferList;
 
   while (entry != NULL) {
     if (entry->bufferType == BUFFER_TYPE_SPS) {
-      /* Apply SPS fixup to enforce low-delay DPB queueing */
-      gs_sps_fix(entry, GS_SPS_BITSTREAM_FIXUP, v4l2_instance.bitstream_buf, &length);
+      if ((size_t)length + (size_t)entry->length + 256 > cap) {
+        fprintf(stderr, "V4L2: SPS unit exceeds output buffer capacity (%zu > %zu)\n",
+                (size_t)length + (size_t)entry->length + 256, cap);
+        pthread_mutex_unlock(&v4l2_instance.state_mutex);
+        return DR_NEED_IDR;
+      }
+      /* Apply SPS fixup directly into V4L2 OUTPUT mmap buffer */
+      gs_sps_fix(entry, GS_SPS_BITSTREAM_FIXUP, dst, &length);
     } else {
-      memcpy(v4l2_instance.bitstream_buf + length, entry->data, entry->length);
+      if ((size_t)length + (size_t)entry->length > cap) {
+        fprintf(stderr, "V4L2: Bitstream unit exceeds output buffer capacity (%zu > %zu)\n",
+                (size_t)length + (size_t)entry->length, cap);
+        pthread_mutex_unlock(&v4l2_instance.state_mutex);
+        return DR_NEED_IDR;
+      }
+      memcpy(dst + length, entry->data, entry->length);
       length += entry->length;
     }
     entry = entry->next;
   }
 
-  int ret = v4l2_codec_feed_packet(&v4l2_instance, v4l2_instance.bitstream_buf, length);
+  int ret = v4l2_codec_queue_output_buffer(&v4l2_instance, buf_idx, length);
   pthread_mutex_unlock(&v4l2_instance.state_mutex);
 
   if (ret != 0) {
-    /* If an individual frame had to be dropped because the decoder was backlogged,
-     * do NOT request an IDR keyframe! Requesting an IDR creates an infinite storm
-     * of massive keyframes that permanently locks up the decoder pipeline. */
-    return DR_OK;
+    return (decodeUnit->frameType == FRAME_TYPE_IDR || ret == -EINVAL) ? DR_NEED_IDR : DR_OK;
   }
 
   return DR_OK;
@@ -274,5 +286,5 @@ DECODER_RENDERER_CALLBACKS decoder_callbacks_v4l2 = {
   .stop = v4l2_stop,
   .cleanup = v4l2_cleanup,
   .submitDecodeUnit = v4l2_submit_decode_unit,
-  .capabilities = CAPABILITY_DIRECT_SUBMIT | CAPABILITY_SLICES_PER_FRAME(4),
+  .capabilities = CAPABILITY_DIRECT_SUBMIT | CAPABILITY_SLICES_PER_FRAME(1),
 };
