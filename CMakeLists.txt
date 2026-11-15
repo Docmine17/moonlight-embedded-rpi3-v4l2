@@ -1,7 +1,10 @@
-cmake_minimum_required(VERSION 3.6)
+cmake_minimum_required(VERSION 3.16)
 project(moonlight-embedded VERSION 2.7.1 LANGUAGES C)
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "Default install prefix" FORCE)
+endif()
 SET(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-SET(CMAKE_C_STANDARD 99)
+SET(CMAKE_C_STANDARD 11)
 include(${CMAKE_ROOT}/Modules/GNUInstallDirs.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/generate_version_header.cmake)
 
@@ -243,4 +246,35 @@ add_subdirectory(docs)
 
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
-install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})
+install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR})
+
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME "moonlight-embedded")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_CONTACT "Moonlight Embedded Contributors")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Open source GameStream and Sunshine client for embedded Linux (V4L2 + DRM/KMS)")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Moonlight Embedded Contributors")
+set(CPACK_DEBIAN_PACKAGE_SECTION "games")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+  set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "armhf")
+endif()
+
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_GENERATE_SHLIBS ON)
+set(CPACK_DEBIAN_PACKAGE_GENERATE_SHLIBS_POLICY ">=")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS
+  "${PROJECT_BINARY_DIR}"
+  "${PROJECT_BINARY_DIR}/libgamestream"
+)
+
+file(WRITE "${PROJECT_BINARY_DIR}/conffiles" "${CMAKE_INSTALL_FULL_SYSCONFDIR}/moonlight.conf\n")
+file(WRITE "${PROJECT_BINARY_DIR}/postinst" "#!/bin/sh\nset -e\nif [ \"$1\" = \"configure\" ]; then\n  ldconfig || true\n  if command -v setcap >/dev/null 2>&1; then\n    setcap cap_sys_nice,cap_ipc_lock+ep /usr/bin/moonlight || true\n  elif [ -x /sbin/setcap ]; then\n    /sbin/setcap cap_sys_nice,cap_ipc_lock+ep /usr/bin/moonlight || true\n  elif [ -x /usr/sbin/setcap ]; then\n    /usr/sbin/setcap cap_sys_nice,cap_ipc_lock+ep /usr/bin/moonlight || true\n  fi\nfi\nexit 0\n")
+file(CHMOD "${PROJECT_BINARY_DIR}/postinst" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${PROJECT_BINARY_DIR}/conffiles;${PROJECT_BINARY_DIR}/postinst")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+
+include(CPack)
