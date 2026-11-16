@@ -31,6 +31,7 @@ void v4l2_drm_release_capture_buffers(struct v4l2_ctx *ctx);
 void v4l2_drm_update_geometry(struct v4l2_ctx *ctx);
 void v4l2_drm_set_colorspace(struct v4l2_ctx *ctx, uint32_t v4l2_colorspace, uint32_t v4l2_quantization);
 void v4l2_drm_present(struct v4l2_ctx *ctx, int new_buf_idx);
+uint64_t v4l2_drm_check_late_latch(struct v4l2_ctx *ctx);
 void v4l2_drm_disable_plane_sync(struct v4l2_ctx *ctx);
 void v4l2_drm_restore_plane_sync(struct v4l2_ctx *ctx);
 void v4l2_drm_drain_pending_flip(struct v4l2_ctx *ctx);

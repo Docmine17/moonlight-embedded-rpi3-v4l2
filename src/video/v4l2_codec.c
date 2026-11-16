@@ -320,6 +320,8 @@ int v4l2_codec_handle_drc(struct v4l2_ctx *ctx) {
   ctx->current_displayed_idx = -1;
   ctx->pending_flip_idx = -1;
   ctx->staged_frame_idx = -1;
+  ctx->last_vblank_ns = 0;
+  ctx->next_commit_ns = 0;
   ctx->plane_needs_full_props = true;
   pthread_mutex_unlock(&ctx->drm_lock);
 

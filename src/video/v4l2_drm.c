@@ -30,6 +30,8 @@
 #include <poll.h>
 #include <libdrm/drm_fourcc.h>
 
+#define V4L2_LATE_LATCH_LEAD_NS 2000000ULL /* Commit 2.0 ms before target VBlank */
+
 static int get_property_info(int fd, uint32_t obj_id, uint32_t obj_type, const char *name,
                              uint32_t *prop_id, uint64_t *init_val) {
   drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, obj_id, obj_type);
@@ -235,10 +237,20 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
 
   ctx->crtc_id = crtc_id;
 
+  ctx->vblank_period_ns = 16666667ULL; /* Default 60 Hz period until calibrated */
+  ctx->last_vblank_ns = 0;
+  ctx->next_commit_ns = 0;
+
   drmModeCrtcPtr crtc = drmModeGetCrtc(ctx->drm_fd, ctx->crtc_id);
   if (crtc && crtc->mode_valid && crtc->width > 0 && crtc->height > 0) {
     ctx->crtc_width = crtc->width;
     ctx->crtc_height = crtc->height;
+    if (crtc->mode.clock > 0 && crtc->mode.htotal > 0 && crtc->mode.vtotal > 0) {
+      uint64_t period = ((uint64_t)crtc->mode.htotal * (uint64_t)crtc->mode.vtotal * 1000000ULL) /
+                        (uint64_t)crtc->mode.clock;
+      if (period >= 8000000ULL && period <= 25000000ULL)
+        ctx->vblank_period_ns = period;
+    }
   } else if (conn->count_modes > 0) {
     ctx->crtc_width = conn->modes[0].hdisplay;
     ctx->crtc_height = conn->modes[0].vdisplay;
@@ -484,35 +496,87 @@ static int commit_atomic_flip(struct v4l2_ctx *ctx, int buf_idx) {
   return ret;
 }
 
-void v4l2_drm_present(struct v4l2_ctx *ctx, int new_buf_idx) {
-  pthread_mutex_lock(&ctx->drm_lock);
-
-  if (ctx->flip_pending) {
-    if (ctx->staged_frame_idx != -1) {
-      /* Drop older staged frame to maintain lowest latency */
-#ifdef V4L2_BENCHMARK
-      ctx->stats.staged_drops++;
-      ctx->stats.sess_staged_drops++;
-#endif
-      v4l2_codec_requeue_capture(ctx, ctx->staged_frame_idx);
-    }
-    ctx->staged_frame_idx = new_buf_idx;
-    pthread_mutex_unlock(&ctx->drm_lock);
+static void commit_staged_locked(struct v4l2_ctx *ctx) {
+  if (ctx->flip_pending || ctx->staged_frame_idx == -1)
     return;
-  }
 
+  int idx = ctx->staged_frame_idx;
+  ctx->staged_frame_idx = -1;
   ctx->flip_pending = true;
-  ctx->pending_flip_idx = new_buf_idx;
+  ctx->pending_flip_idx = idx;
 
-  int ret = commit_atomic_flip(ctx, new_buf_idx);
-  if (ret != 0) {
+  if (commit_atomic_flip(ctx, idx) != 0) {
     /* If commit failed, reset pending state and requeue */
     ctx->flip_pending = false;
     ctx->pending_flip_idx = -1;
-    v4l2_codec_requeue_capture(ctx, new_buf_idx);
+    v4l2_codec_requeue_capture(ctx, idx);
+  }
+}
+
+static uint64_t compute_next_deadline_locked(struct v4l2_ctx *ctx, uint64_t now) {
+  if (ctx->last_vblank_ns == 0 || ctx->vblank_period_ns == 0 || now < ctx->last_vblank_ns)
+    return 0;
+
+  uint64_t elapsed = now - ctx->last_vblank_ns;
+  if (elapsed > ctx->vblank_period_ns * 4ULL)
+    return 0;
+
+  uint64_t periods = (elapsed / ctx->vblank_period_ns) + 1ULL;
+  uint64_t next_vblank = ctx->last_vblank_ns + periods * ctx->vblank_period_ns;
+
+  /* If already within V4L2_LATE_LATCH_LEAD_NS of next_vblank, commit immediately */
+  if (next_vblank <= now + V4L2_LATE_LATCH_LEAD_NS)
+    return 0;
+
+  return next_vblank - V4L2_LATE_LATCH_LEAD_NS;
+}
+
+void v4l2_drm_present(struct v4l2_ctx *ctx, int new_buf_idx) {
+  pthread_mutex_lock(&ctx->drm_lock);
+
+  if (ctx->staged_frame_idx != -1) {
+    /* Drop older staged frame to maintain lowest latency */
+#ifdef V4L2_BENCHMARK
+    ctx->stats.staged_drops++;
+    ctx->stats.sess_staged_drops++;
+#endif
+    v4l2_codec_requeue_capture(ctx, ctx->staged_frame_idx);
+  }
+  ctx->staged_frame_idx = new_buf_idx;
+
+  if (!ctx->flip_pending) {
+    uint64_t now = v4l2_now_ns();
+    uint64_t deadline = compute_next_deadline_locked(ctx, now);
+    if (deadline == 0 || now >= deadline) {
+      ctx->next_commit_ns = 0;
+      commit_staged_locked(ctx);
+    } else {
+      ctx->next_commit_ns = deadline;
+    }
   }
 
   pthread_mutex_unlock(&ctx->drm_lock);
+}
+
+uint64_t v4l2_drm_check_late_latch(struct v4l2_ctx *ctx) {
+  uint64_t wait_ns = 50000000ULL; /* Default 50 ms poll timeout */
+  pthread_mutex_lock(&ctx->drm_lock);
+
+  if (!ctx->flip_pending && ctx->staged_frame_idx != -1) {
+    uint64_t now = v4l2_now_ns();
+    if (ctx->next_commit_ns == 0)
+      ctx->next_commit_ns = compute_next_deadline_locked(ctx, now);
+
+    if (ctx->next_commit_ns == 0 || now >= ctx->next_commit_ns) {
+      ctx->next_commit_ns = 0;
+      commit_staged_locked(ctx);
+    } else {
+      wait_ns = ctx->next_commit_ns - now;
+    }
+  }
+
+  pthread_mutex_unlock(&ctx->drm_lock);
+  return wait_ns;
 }
 
 void v4l2_drm_drain_pending_flip(struct v4l2_ctx *ctx) {
@@ -603,9 +667,22 @@ void v4l2_drm_page_flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
 
   pthread_mutex_lock(&ctx->drm_lock);
 
+  uint64_t now_vblank = v4l2_now_ns();
+  uint64_t hw_vblank = (uint64_t)tv_sec * 1000000000ULL + (uint64_t)tv_usec * 1000ULL;
+  uint64_t vblank_ts = (hw_vblank > 0 && now_vblank >= hw_vblank && (now_vblank - hw_vblank) < 10000000ULL)
+                         ? hw_vblank
+                         : now_vblank;
+  if (ctx->last_vblank_ns > 0 && vblank_ts > ctx->last_vblank_ns) {
+    uint64_t dt = vblank_ts - ctx->last_vblank_ns;
+    if (dt >= 8000000ULL && dt <= 20000000ULL) {
+      ctx->vblank_period_ns = (ctx->vblank_period_ns * 7ULL + dt) / 8ULL;
+    }
+  }
+  ctx->last_vblank_ns = vblank_ts;
+
 #ifdef V4L2_BENCHMARK
   {
-    uint64_t t_vblank = v4l2_now_ns();
+    uint64_t t_vblank = now_vblank;
     int idx = ctx->pending_flip_idx;
     if (idx >= 0 && idx < V4L2_MAX_CAPTURE_BUFFERS) {
       ctx->stats.disp_frames++;
@@ -688,19 +765,17 @@ void v4l2_drm_page_flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
   }
 
   ctx->current_displayed_idx = ctx->pending_flip_idx;
+  ctx->pending_flip_idx = -1;
   ctx->flip_pending = false;
 
-  /* 2. If a newer frame arrived during VBlank wait, commit it immediately */
+  /* 2. Schedule Late-Latch deadline for staged frame instead of committing immediately */
   if (ctx->staged_frame_idx != -1) {
-    int next_idx = ctx->staged_frame_idx;
-    ctx->staged_frame_idx = -1;
-    ctx->flip_pending = true;
-    ctx->pending_flip_idx = next_idx;
-
-    if (commit_atomic_flip(ctx, next_idx) != 0) {
-      ctx->flip_pending = false;
-      ctx->pending_flip_idx = -1;
-      v4l2_codec_requeue_capture(ctx, next_idx);
+    uint64_t deadline = compute_next_deadline_locked(ctx, now_vblank);
+    if (deadline == 0 || now_vblank >= deadline) {
+      ctx->next_commit_ns = 0;
+      commit_staged_locked(ctx);
+    } else {
+      ctx->next_commit_ns = deadline;
     }
   }
 

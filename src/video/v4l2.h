@@ -27,9 +27,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#ifdef V4L2_BENCHMARK
 #include <time.h>
-#endif
 #include <linux/videodev2.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -50,6 +48,12 @@ struct v4l2_buf {
   uint64_t t_dqbuf_ns;
 #endif
 };
+
+static inline uint64_t v4l2_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 #ifdef V4L2_BENCHMARK
 struct v4l2_bench_stats {
@@ -82,12 +86,6 @@ struct v4l2_bench_stats {
   uint64_t sess_total_pi_min_ns;
   uint64_t sess_total_pi_max_ns;
 };
-
-static inline uint64_t v4l2_now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
 #endif
 
 struct v4l2_ctx {
@@ -169,6 +167,9 @@ struct v4l2_ctx {
   int current_displayed_idx;
   int pending_flip_idx;
   int staged_frame_idx;
+  uint64_t last_vblank_ns;
+  uint64_t vblank_period_ns;
+  uint64_t next_commit_ns;
 
   /* Threading & lifecycle */
   pthread_mutex_t state_mutex;

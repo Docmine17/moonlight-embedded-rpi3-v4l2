@@ -85,9 +85,19 @@ static void *v4l2_event_thread(void *arg) {
     pfd[1].events = POLLIN;
     pfd[1].revents = 0;
 
-    int ret = poll(pfd, 2, 50);
-    if (ret <= 0)
+    uint64_t wait_ns = v4l2_drm_check_late_latch(ctx);
+    struct timespec ts = {
+      .tv_sec = (time_t)(wait_ns / 1000000000ULL),
+      .tv_nsec = (long)(wait_ns % 1000000000ULL),
+    };
+
+    int ret = ppoll(pfd, 2, &ts, NULL);
+    if (ret < 0)
       continue;
+    if (ret == 0) {
+      v4l2_drm_check_late_latch(ctx);
+      continue;
+    }
 
     /* 1. Handle V4L2 Dynamic Resolution / Format Change */
     if (pfd[0].revents & POLLPRI) {
@@ -162,6 +172,9 @@ static void *v4l2_event_thread(void *arg) {
     if (pfd[1].revents & POLLIN) {
       drmHandleEvent(ctx->drm_fd, &evctx);
     }
+
+    /* 4. Fire Late-Latch commit if deadline was reached during event processing */
+    v4l2_drm_check_late_latch(ctx);
   }
 
   return NULL;
