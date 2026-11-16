@@ -291,6 +291,11 @@ int v4l2_codec_queue_output_buffer(struct v4l2_ctx *ctx, int index, size_t bytes
   buf.length = 1;
   buf.m.planes = planes;
   buf.m.planes[0].bytesused = bytesused;
+#ifdef V4L2_BENCHMARK
+  uint64_t t_qbuf_ns = ctx->output_bufs[index].t_submit_ns;
+  buf.timestamp.tv_sec = (time_t)(t_qbuf_ns / 1000000000ULL);
+  buf.timestamp.tv_usec = (suseconds_t)((t_qbuf_ns % 1000000000ULL) / 1000ULL);
+#endif
 
   if (ioctl(ctx->v4l2_fd, VIDIOC_QBUF, &buf) != 0) {
     perror("VIDIOC_QBUF on OUTPUT_MPLANE failed");

@@ -20,12 +20,12 @@ while [[ $# -gt 0 ]]; do
       NO_BUILD=1
       shift
       ;;
-    --clean|--rebuild-image)
+    --clean|--rebuild-image|--stats|--no-stats)
       BUILD_ARGS+=("$1")
       shift
       ;;
     -h|--help)
-      echo "Usage: $0 [user@pi-host] [--no-build] [--clean] [--rebuild-image]"
+      echo "Usage: $0 [user@pi-host] [--no-build] [--clean] [--rebuild-image] [--stats|--no-stats]"
       echo ""
       echo "Default target: ${PI_TARGET} (override with PI_TARGET in .env.local or positional argument)."
       exit 0

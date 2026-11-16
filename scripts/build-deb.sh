@@ -8,6 +8,7 @@ DOCKERFILE="${PROJECT_ROOT}/docker/Dockerfile.cross-trixie-arm64"
 BUILD_DIR="build-trixie-arm64"
 REBUILD_IMAGE=0
 CLEAN_BUILD=0
+ENABLE_STATS="OFF"
 
 for arg in "$@"; do
   case "$arg" in
@@ -17,8 +18,14 @@ for arg in "$@"; do
     --clean)
       CLEAN_BUILD=1
       ;;
+    --stats)
+      ENABLE_STATS="ON"
+      ;;
+    --no-stats)
+      ENABLE_STATS="OFF"
+      ;;
     -h|--help)
-      echo "Usage: $0 [--rebuild-image] [--clean]"
+      echo "Usage: $0 [--rebuild-image] [--clean] [--stats|--no-stats]"
       exit 0
       ;;
     *)
@@ -56,7 +63,7 @@ fi
 
 mkdir -p "${PROJECT_ROOT}/${BUILD_DIR}"
 
-echo "==> Cross-compiling (Release, Cortex-A53 + LTO) and packaging .deb (arm64 / Debian Trixie)..."
+echo "==> Cross-compiling (Release, Cortex-A53 + LTO, V4L2_STATS=${ENABLE_STATS}) and packaging .deb (arm64 / Debian Trixie)..."
 "${CONTAINER_ENGINE}" run --rm \
   "${RUN_USER_ARGS[@]}" \
   -v "${PROJECT_ROOT}:/workspace" \
@@ -64,13 +71,12 @@ echo "==> Cross-compiling (Release, Cortex-A53 + LTO) and packaging .deb (arm64 
   "${IMAGE_NAME}" \
   bash -c "
     set -euo pipefail
-    if [[ ! -f ${BUILD_DIR}/build.ninja ]]; then
-      cmake -B ${BUILD_DIR} -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-        -DCMAKE_INSTALL_PREFIX=/usr \
-        -DCMAKE_TOOLCHAIN_FILE=/workspace/cmake/Toolchain-aarch64-linux-gnu.cmake
-    fi
+    cmake -B ${BUILD_DIR} -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_TOOLCHAIN_FILE=/workspace/cmake/Toolchain-aarch64-linux-gnu.cmake \
+      -DENABLE_V4L2_STATS=${ENABLE_STATS}
     cmake --build ${BUILD_DIR} --parallel
     if grep -q -- '-DLC_DEBUG' ${BUILD_DIR}/build.ninja; then
       echo 'Error: -DLC_DEBUG found in build.ninja; Release build expected.' >&2

@@ -119,7 +119,27 @@ static void *v4l2_event_thread(void *arg) {
             v4l2_codec_requeue_capture(ctx, buf.index);
           }
         } else {
+#ifdef V4L2_BENCHMARK
+          uint64_t t_dq = v4l2_now_ns();
+          uint64_t t_sub = (uint64_t)buf.timestamp.tv_sec * 1000000000ULL +
+                           (uint64_t)buf.timestamp.tv_usec * 1000ULL;
+          if ((int)buf.index < V4L2_MAX_CAPTURE_BUFFERS) {
+            ctx->capture_bufs[buf.index].t_submit_ns = t_sub;
+            ctx->capture_bufs[buf.index].t_dqbuf_ns = t_dq;
+          }
+          ctx->stats.dec_frames++;
+          ctx->stats.sess_dec_frames++;
+          if (t_sub > 0 && t_dq >= t_sub) {
+            uint64_t hw_ns = t_dq - t_sub;
+            ctx->stats.hw_dec_total_ns += hw_ns;
+            ctx->stats.sess_hw_dec_total_ns += hw_ns;
+          }
+#endif
           if (newest_idx != -1) {
+#ifdef V4L2_BENCHMARK
+            ctx->stats.burst_drops++;
+            ctx->stats.sess_burst_drops++;
+#endif
             v4l2_codec_requeue_capture(ctx, newest_idx);
           }
           newest_idx = (int)buf.index;
@@ -205,6 +225,14 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
   /* Elevate display presentation thread to real-time priority (45: optimal for video display) */
   configure_realtime_thread(v4l2_instance.event_thread, 45, "display");
 
+#ifdef V4L2_BENCHMARK
+  v4l2_instance.stats.window_start_ns = v4l2_now_ns();
+  v4l2_instance.stats.session_start_ns = v4l2_instance.stats.window_start_ns;
+  v4l2_instance.stats.total_pi_min_ns = UINT64_MAX;
+  v4l2_instance.stats.sess_total_pi_min_ns = UINT64_MAX;
+  fprintf(stderr, "V4L2: Compile-time latency benchmark telemetry ENABLED (V4L2_BENCHMARK)\n");
+#endif
+
   return DR_OK;
 }
 
@@ -227,6 +255,42 @@ static void v4l2_cleanup(void) {
 
   /* 1. Drain pending page flips before releasing buffers */
   v4l2_drm_drain_pending_flip(&v4l2_instance);
+
+#ifdef V4L2_BENCHMARK
+  {
+    uint64_t end_ns = v4l2_now_ns();
+    double dur_s = (end_ns > v4l2_instance.stats.session_start_ns)
+                     ? (double)(end_ns - v4l2_instance.stats.session_start_ns) / 1e9
+                     : 0.0;
+    uint64_t rx = atomic_load_explicit(&v4l2_instance.stats.sess_rx_frames, memory_order_relaxed);
+    uint64_t sub_ns = atomic_load_explicit(&v4l2_instance.stats.sess_submit_total_ns, memory_order_relaxed);
+    uint64_t wait_ns = atomic_load_explicit(&v4l2_instance.stats.sess_submit_wait_ns, memory_order_relaxed);
+    uint64_t dec = v4l2_instance.stats.sess_dec_frames;
+    uint64_t disp = v4l2_instance.stats.sess_disp_frames;
+
+    if (dur_s > 0.0 && (rx > 0 || dec > 0 || disp > 0)) {
+      double sub_ms = rx ? ((double)sub_ns / rx) / 1e6 : 0.0;
+      double wait_ms = rx ? ((double)wait_ns / rx) / 1e6 : 0.0;
+      double hw_ms = dec ? ((double)v4l2_instance.stats.sess_hw_dec_total_ns / dec) / 1e6 : 0.0;
+      double vb_ms = disp ? ((double)v4l2_instance.stats.sess_vblank_wait_total_ns / disp) / 1e6 : 0.0;
+      double pi_ms = disp ? ((double)v4l2_instance.stats.sess_total_pi_ns / disp) / 1e6 : 0.0;
+      double min_ms = (v4l2_instance.stats.sess_total_pi_min_ns != UINT64_MAX)
+                        ? (double)v4l2_instance.stats.sess_total_pi_min_ns / 1e6
+                        : 0.0;
+      double max_ms = (double)v4l2_instance.stats.sess_total_pi_max_ns / 1e6;
+
+      fprintf(stderr,
+              "[V4L2 BENCH SUMMARY %.1fs] rx: %.1f fps (%llu) | dec: %.1f fps (%llu) | disp: %.1f fps (%llu) | drops staged:%llu burst:%llu | submit: %.2fms (wait:%.2fms) | hw_dec: %.2fms | vblank_wait: %.2fms | total_pi: %.2fms (min:%.2f max:%.2f)\n",
+              dur_s,
+              (double)rx / dur_s, (unsigned long long)rx,
+              (double)dec / dur_s, (unsigned long long)dec,
+              (double)disp / dur_s, (unsigned long long)disp,
+              (unsigned long long)v4l2_instance.stats.sess_staged_drops,
+              (unsigned long long)v4l2_instance.stats.sess_burst_drops,
+              sub_ms, wait_ms, hw_ms, vb_ms, pi_ms, min_ms, max_ms);
+    }
+  }
+#endif
 
   /* 2. Synchronously restore console plane scanout (or disable if none was saved) */
   v4l2_drm_restore_plane_sync(&v4l2_instance);
@@ -262,9 +326,16 @@ static int v4l2_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     configure_realtime_thread(pthread_self(), 40, "submit");
   }
 
+#ifdef V4L2_BENCHMARK
+  uint64_t t_start = v4l2_now_ns();
+#endif
+
   /* Allow extra wait during initial DRC or IDR frames so the first keyframe isn't dropped */
   int timeout_ms = (decodeUnit->frameType == FRAME_TYPE_IDR || !v4l2_instance.capture_streaming) ? 51 : 12;
   int buf_idx = v4l2_codec_acquire_output_buffer(&v4l2_instance, timeout_ms);
+#ifdef V4L2_BENCHMARK
+  uint64_t t_acq = v4l2_now_ns();
+#endif
   if (buf_idx < 0) {
     pthread_mutex_unlock(&v4l2_instance.state_mutex);
     /* Request IDR only when an IDR itself could not be queued; avoid IDR storms on transient P-frame drops */
@@ -304,7 +375,23 @@ static int v4l2_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     entry = entry->next;
   }
 
+#ifdef V4L2_BENCHMARK
+  v4l2_instance.output_bufs[buf_idx].t_submit_ns = t_start;
+#endif
   int ret = v4l2_codec_queue_output_buffer(&v4l2_instance, buf_idx, length);
+#ifdef V4L2_BENCHMARK
+  if (ret == 0) {
+    uint64_t t_end = v4l2_now_ns();
+    uint64_t wait_ns = (t_acq >= t_start) ? (t_acq - t_start) : 0;
+    uint64_t sub_ns = (t_end >= t_start) ? (t_end - t_start) : 0;
+    atomic_fetch_add_explicit(&v4l2_instance.stats.rx_frames, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v4l2_instance.stats.submit_wait_ns, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v4l2_instance.stats.submit_total_ns, sub_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v4l2_instance.stats.sess_rx_frames, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v4l2_instance.stats.sess_submit_wait_ns, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v4l2_instance.stats.sess_submit_total_ns, sub_ns, memory_order_relaxed);
+  }
+#endif
   pthread_mutex_unlock(&v4l2_instance.state_mutex);
 
   if (ret != 0) {

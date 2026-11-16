@@ -490,6 +490,10 @@ void v4l2_drm_present(struct v4l2_ctx *ctx, int new_buf_idx) {
   if (ctx->flip_pending) {
     if (ctx->staged_frame_idx != -1) {
       /* Drop older staged frame to maintain lowest latency */
+#ifdef V4L2_BENCHMARK
+      ctx->stats.staged_drops++;
+      ctx->stats.sess_staged_drops++;
+#endif
       v4l2_codec_requeue_capture(ctx, ctx->staged_frame_idx);
     }
     ctx->staged_frame_idx = new_buf_idx;
@@ -598,6 +602,85 @@ void v4l2_drm_page_flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     return;
 
   pthread_mutex_lock(&ctx->drm_lock);
+
+#ifdef V4L2_BENCHMARK
+  {
+    uint64_t t_vblank = v4l2_now_ns();
+    int idx = ctx->pending_flip_idx;
+    if (idx >= 0 && idx < V4L2_MAX_CAPTURE_BUFFERS) {
+      ctx->stats.disp_frames++;
+      ctx->stats.sess_disp_frames++;
+
+      uint64_t t_dq = ctx->capture_bufs[idx].t_dqbuf_ns;
+      uint64_t t_sub = ctx->capture_bufs[idx].t_submit_ns;
+      if (t_dq > 0 && t_vblank >= t_dq) {
+        uint64_t vb_ns = t_vblank - t_dq;
+        ctx->stats.vblank_wait_total_ns += vb_ns;
+        ctx->stats.sess_vblank_wait_total_ns += vb_ns;
+      }
+      if (t_sub > 0 && t_vblank >= t_sub) {
+        uint64_t pi_ns = t_vblank - t_sub;
+        ctx->stats.total_pi_ns += pi_ns;
+        ctx->stats.sess_total_pi_ns += pi_ns;
+        if (pi_ns < ctx->stats.total_pi_min_ns)
+          ctx->stats.total_pi_min_ns = pi_ns;
+        if (pi_ns > ctx->stats.total_pi_max_ns)
+          ctx->stats.total_pi_max_ns = pi_ns;
+        if (pi_ns < ctx->stats.sess_total_pi_min_ns)
+          ctx->stats.sess_total_pi_min_ns = pi_ns;
+        if (pi_ns > ctx->stats.sess_total_pi_max_ns)
+          ctx->stats.sess_total_pi_max_ns = pi_ns;
+      }
+    }
+
+    uint64_t elapsed_ns = t_vblank - ctx->stats.window_start_ns;
+    if (elapsed_ns >= 1000000000ULL) {
+      double win_s = (double)elapsed_ns / 1e9;
+      uint32_t rx = atomic_exchange_explicit(&ctx->stats.rx_frames, 0, memory_order_relaxed);
+      uint64_t sub_ns = atomic_exchange_explicit(&ctx->stats.submit_total_ns, 0, memory_order_relaxed);
+      uint64_t wait_ns = atomic_exchange_explicit(&ctx->stats.submit_wait_ns, 0, memory_order_relaxed);
+      uint32_t dec = ctx->stats.dec_frames;
+      uint32_t disp = ctx->stats.disp_frames;
+
+      double sub_ms = rx ? ((double)sub_ns / rx) / 1e6 : 0.0;
+      double wait_ms = rx ? ((double)wait_ns / rx) / 1e6 : 0.0;
+      double hw_ms = dec ? ((double)ctx->stats.hw_dec_total_ns / dec) / 1e6 : 0.0;
+      double vb_ms = disp ? ((double)ctx->stats.vblank_wait_total_ns / disp) / 1e6 : 0.0;
+      double pi_ms = disp ? ((double)ctx->stats.total_pi_ns / disp) / 1e6 : 0.0;
+      double min_ms = (ctx->stats.total_pi_min_ns != UINT64_MAX)
+                        ? (double)ctx->stats.total_pi_min_ns / 1e6
+                        : 0.0;
+      double max_ms = (double)ctx->stats.total_pi_max_ns / 1e6;
+
+      fprintf(stderr,
+              "[V4L2 BENCH %.1fs] rx: %.1f fps | dec: %.1f fps | disp: %.1f fps (drop staged:%u burst:%u) | submit: %.2fms (wait:%.2fms) | hw_dec: %.2fms | vblank_wait: %.2fms | total_pi: %.2fms (min:%.2f max:%.2f)\n",
+              win_s,
+              (double)rx / win_s,
+              (double)dec / win_s,
+              (double)disp / win_s,
+              ctx->stats.staged_drops,
+              ctx->stats.burst_drops,
+              sub_ms,
+              wait_ms,
+              hw_ms,
+              vb_ms,
+              pi_ms,
+              min_ms,
+              max_ms);
+
+      ctx->stats.dec_frames = 0;
+      ctx->stats.disp_frames = 0;
+      ctx->stats.staged_drops = 0;
+      ctx->stats.burst_drops = 0;
+      ctx->stats.hw_dec_total_ns = 0;
+      ctx->stats.vblank_wait_total_ns = 0;
+      ctx->stats.total_pi_ns = 0;
+      ctx->stats.total_pi_min_ns = UINT64_MAX;
+      ctx->stats.total_pi_max_ns = 0;
+      ctx->stats.window_start_ns = t_vblank;
+    }
+  }
+#endif
 
   /* 1. Requeue previously displayed buffer to V4L2 decoder */
   if (ctx->current_displayed_idx != -1) {

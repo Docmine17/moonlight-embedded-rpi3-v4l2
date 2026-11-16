@@ -27,6 +27,9 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#ifdef V4L2_BENCHMARK
+#include <time.h>
+#endif
 #include <linux/videodev2.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -42,7 +45,50 @@ struct v4l2_buf {
   uint32_t gem_handle;
   uint32_t fb_id;
   bool queued;
+#ifdef V4L2_BENCHMARK
+  uint64_t t_submit_ns;
+  uint64_t t_dqbuf_ns;
+#endif
 };
+
+#ifdef V4L2_BENCHMARK
+struct v4l2_bench_stats {
+  uint64_t window_start_ns;
+  uint64_t session_start_ns;
+  /* Per-1s window counters */
+  _Atomic uint32_t rx_frames;
+  uint32_t dec_frames;
+  uint32_t disp_frames;
+  uint32_t staged_drops;
+  uint32_t burst_drops;
+  _Atomic uint64_t submit_total_ns;
+  _Atomic uint64_t submit_wait_ns;
+  uint64_t hw_dec_total_ns;
+  uint64_t vblank_wait_total_ns;
+  uint64_t total_pi_ns;
+  uint64_t total_pi_min_ns;
+  uint64_t total_pi_max_ns;
+  /* Session cumulative counters */
+  _Atomic uint64_t sess_rx_frames;
+  uint64_t sess_dec_frames;
+  uint64_t sess_disp_frames;
+  uint64_t sess_staged_drops;
+  uint64_t sess_burst_drops;
+  _Atomic uint64_t sess_submit_total_ns;
+  _Atomic uint64_t sess_submit_wait_ns;
+  uint64_t sess_hw_dec_total_ns;
+  uint64_t sess_vblank_wait_total_ns;
+  uint64_t sess_total_pi_ns;
+  uint64_t sess_total_pi_min_ns;
+  uint64_t sess_total_pi_max_ns;
+};
+
+static inline uint64_t v4l2_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+#endif
 
 struct v4l2_ctx {
   int v4l2_fd;
@@ -130,6 +176,9 @@ struct v4l2_ctx {
   atomic_bool streaming;
   bool submit_rt_configured;
   pthread_t event_thread;
+#ifdef V4L2_BENCHMARK
+  struct v4l2_bench_stats stats;
+#endif
 };
 
 #endif /* VIDEO_V4L2_H */
