@@ -192,7 +192,7 @@ static void test_sps_vui_low_latency_fixup(void) {
   printf("[TEST] Testing H.264 SPS VUI Low-Latency Fixup & Level Clamping...\n");
 
   uint8_t in_buf[256];
-  uint8_t out_buf[256];
+  uint8_t out_buf[512];
   LENTRY entry;
   memset(&entry, 0, sizeof(entry));
   entry.bufferType = BUFFER_TYPE_SPS;
@@ -330,6 +330,46 @@ static void test_colorspace_and_full_props_flag(void) {
   printf("  -> Colorspace mapping and full-props flag PASSED.\n");
 }
 
+static void test_drm_refresh_rate_x100(void) {
+  printf("[TEST] Testing DRM Mode Refresh Rate Calculation (x100)...\n");
+
+  drmModeModeInfo mode;
+  memset(&mode, 0, sizeof(mode));
+  /* 1080p60 CEA: 148.500 MHz / (2200 * 1125) = 60.00 Hz -> 6000 */
+  mode.clock = 148500;
+  mode.htotal = 2200;
+  mode.vtotal = 1125;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 6000);
+
+  /* 1080p59.94 CEA: 148.352 MHz / (2200 * 1125) = 59.94 Hz -> 5994 */
+  mode.clock = 148352;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 5994);
+
+  /* 23.976 Hz rounding: 74.176 MHz / (2750 * 1125) = 23.976 Hz -> 2398 */
+  mode.clock = 74176;
+  mode.htotal = 2750;
+  mode.vtotal = 1125;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 2398);
+
+  /* Interlaced doubles field rate; dblscan halves it */
+  mode.clock = 74250;
+  mode.htotal = 2200;
+  mode.vtotal = 1125;
+  mode.flags = DRM_MODE_FLAG_INTERLACE;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 6000);
+
+  mode.flags = DRM_MODE_FLAG_DBLSCAN;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 1500);
+
+  /* Fallback to vrefresh when timings are absent */
+  memset(&mode, 0, sizeof(mode));
+  mode.vrefresh = 60;
+  assert(v4l2_drm_calc_refresh_x100(&mode) == 6000);
+  assert(v4l2_drm_calc_refresh_x100(NULL) == 0);
+
+  printf("  -> DRM mode refresh rate x100 PASSED.\n");
+}
+
 int main(void) {
   printf("=== RUNNING V4L2 BACKEND TEST SUITE ===\n");
   test_geometry_scaling();
@@ -338,6 +378,7 @@ int main(void) {
   test_sps_vui_low_latency_fixup();
   test_export_fd_cleanup_safety();
   test_colorspace_and_full_props_flag();
+  test_drm_refresh_rate_x100();
   printf("=== ALL V4L2 BACKEND TESTS PASSED SUCCESSFULLY! ===\n");
   return 0;
 }

@@ -237,6 +237,19 @@ AUDIO_RENDERER_CALLBACKS* platform_get_audio(enum platform system, char* audio_d
   return NULL;
 }
 
+int platform_get_refresh_rate_x100(enum platform system) {
+  switch (system) {
+  #ifdef HAVE_V4L2
+  case V4L2: {
+    int (*fn)(void) = (int (*)(void)) dlsym(RTLD_DEFAULT, "v4l2_drm_get_refresh_rate_x100");
+    return fn ? fn() : 0;
+  }
+  #endif
+  default:
+    return 0;
+  }
+}
+
 bool platform_prefers_codec(enum platform system, enum codecs codec) {
   switch (codec) {
   case CODEC_H264:

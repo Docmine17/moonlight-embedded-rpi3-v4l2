@@ -134,8 +134,15 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
     printf("Ignoring invalid rotation value: %d\n", config->rotate);
   }
 
+  if (config->stream.clientRefreshRateX100 == 0) {
+    int refresh_x100 = platform_get_refresh_rate_x100(system);
+    config->stream.clientRefreshRateX100 = (refresh_x100 > 0) ? refresh_x100 : (config->stream.fps * 100);
+  }
+
   if (config->debug_level > 0) {
-    printf("Stream %d x %d, %d fps, %d kbps\n", config->stream.width, config->stream.height, config->stream.fps, config->stream.bitrate);
+    printf("Stream %d x %d, %d fps (clientRefreshRateX100=%d), %d kbps\n",
+           config->stream.width, config->stream.height, config->stream.fps,
+           config->stream.clientRefreshRateX100, config->stream.bitrate);
     connection_debug = true;
   }
 

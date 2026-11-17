@@ -165,6 +165,126 @@ void v4l2_drm_set_colorspace(struct v4l2_ctx *ctx, uint32_t v4l2_colorspace, uin
   ctx->plane_needs_full_props = true;
 }
 
+int v4l2_drm_calc_refresh_x100(const drmModeModeInfo *mode) {
+  if (!mode)
+    return 0;
+
+  if (mode->clock > 0 && mode->htotal > 0 && mode->vtotal > 0) {
+    uint64_t num = (uint64_t)mode->clock * 100000ULL;
+    if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+      num *= 2ULL;
+
+    uint64_t denom = (uint64_t)mode->htotal * (uint64_t)mode->vtotal;
+    if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+      denom *= 2ULL;
+    if (mode->vscan > 1)
+      denom *= (uint64_t)mode->vscan;
+
+    if (denom > 0) {
+      int x100 = (int)((num + denom / 2ULL) / denom);
+      if (x100 > 0)
+        return x100;
+    }
+  }
+
+  return (mode->vrefresh > 0) ? (int)(mode->vrefresh * 100U) : 0;
+}
+
+static int find_active_drm_mode(int drm_fd, bool probe_connectors,
+                                drmModeResPtr *res_out, uint32_t *conn_id_out,
+                                uint32_t *crtc_id_out, drmModeModeInfo *mode_out,
+                                bool *mode_valid_out) {
+  drmModeResPtr res = drmModeGetResources(drm_fd);
+  if (!res)
+    return -1;
+
+  drmModeConnectorPtr conn = NULL;
+  for (int i = 0; i < res->count_connectors; i++) {
+    conn = probe_connectors ? drmModeGetConnector(drm_fd, res->connectors[i])
+                            : drmModeGetConnectorCurrent(drm_fd, res->connectors[i]);
+    if (!probe_connectors && conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes == 0) {
+      drmModeFreeConnector(conn);
+      conn = drmModeGetConnector(drm_fd, res->connectors[i]);
+    }
+    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0)
+      break;
+
+    if (conn) {
+      drmModeFreeConnector(conn);
+      conn = NULL;
+    }
+  }
+
+  if (!conn) {
+    drmModeFreeResources(res);
+    return -1;
+  }
+
+  drmModeEncoderPtr enc = NULL;
+  for (int i = 0; i < res->count_encoders; i++) {
+    enc = drmModeGetEncoder(drm_fd, res->encoders[i]);
+    if (enc && enc->encoder_id == conn->encoder_id)
+      break;
+
+    if (enc) {
+      drmModeFreeEncoder(enc);
+      enc = NULL;
+    }
+  }
+
+  uint32_t crtc_id = 0;
+  if (enc) {
+    crtc_id = enc->crtc_id;
+    drmModeFreeEncoder(enc);
+  }
+  if (crtc_id == 0 && res->count_crtcs > 0)
+    crtc_id = res->crtcs[0];
+
+  bool mode_valid = false;
+  drmModeModeInfo mode;
+  memset(&mode, 0, sizeof(mode));
+
+  drmModeCrtcPtr crtc = crtc_id ? drmModeGetCrtc(drm_fd, crtc_id) : NULL;
+  if (crtc && crtc->mode_valid && crtc->width > 0 && crtc->height > 0) {
+    mode = crtc->mode;
+    mode_valid = true;
+  } else if (conn->count_modes > 0) {
+    mode = conn->modes[0];
+  }
+  if (crtc)
+    drmModeFreeCrtc(crtc);
+
+  if (conn_id_out)
+    *conn_id_out = conn->connector_id;
+  if (crtc_id_out)
+    *crtc_id_out = crtc_id;
+  if (mode_out)
+    *mode_out = mode;
+  if (mode_valid_out)
+    *mode_valid_out = mode_valid;
+
+  drmModeFreeConnector(conn);
+  if (res_out)
+    *res_out = res;
+  else
+    drmModeFreeResources(res);
+
+  return 0;
+}
+
+int v4l2_drm_get_refresh_rate_x100(void) {
+  int fd = open_vc4_drm_device();
+  if (fd < 0)
+    return 0;
+
+  drmModeModeInfo mode;
+  memset(&mode, 0, sizeof(mode));
+  int ret = find_active_drm_mode(fd, false, NULL, NULL, NULL, &mode, NULL);
+  close(fd);
+
+  return (ret == 0) ? v4l2_drm_calc_refresh_x100(&mode) : 0;
+}
+
 int v4l2_drm_init(struct v4l2_ctx *ctx) {
   ctx->drm_fd = open_vc4_drm_device();
   if (ctx->drm_fd < 0) {
@@ -183,85 +303,34 @@ int v4l2_drm_init(struct v4l2_ctx *ctx) {
     return -1;
   }
 
-  drmModeResPtr res = drmModeGetResources(ctx->drm_fd);
-  if (!res) {
-    perror("drmModeGetResources failed");
-    close(ctx->drm_fd);
-    ctx->drm_fd = -1;
-    return -1;
-  }
-
-  drmModeConnectorPtr conn = NULL;
-  for (int i = 0; i < res->count_connectors; i++) {
-    conn = drmModeGetConnector(ctx->drm_fd, res->connectors[i]);
-    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0)
-      break;
-
-    if (conn) {
-      drmModeFreeConnector(conn);
-      conn = NULL;
-    }
-  }
-
-  if (!conn) {
+  drmModeResPtr res = NULL;
+  drmModeModeInfo active_mode;
+  bool mode_valid = false;
+  if (find_active_drm_mode(ctx->drm_fd, true, &res, &ctx->conn_id, &ctx->crtc_id,
+                           &active_mode, &mode_valid) != 0) {
     fprintf(stderr, "No connected DRM connector found\n");
-    drmModeFreeResources(res);
     close(ctx->drm_fd);
     ctx->drm_fd = -1;
     return -1;
   }
-
-  ctx->conn_id = conn->connector_id;
-
-  drmModeEncoderPtr enc = NULL;
-  for (int i = 0; i < res->count_encoders; i++) {
-    enc = drmModeGetEncoder(ctx->drm_fd, res->encoders[i]);
-    if (enc && enc->encoder_id == conn->encoder_id)
-      break;
-
-    if (enc) {
-      drmModeFreeEncoder(enc);
-      enc = NULL;
-    }
-  }
-
-  uint32_t crtc_id = 0;
-  if (enc) {
-    crtc_id = enc->crtc_id;
-    drmModeFreeEncoder(enc);
-  }
-
-  if (crtc_id == 0 && res->count_crtcs > 0) {
-    crtc_id = res->crtcs[0];
-  }
-
-  ctx->crtc_id = crtc_id;
 
   ctx->vblank_period_ns = 16666667ULL; /* Default 60 Hz period until calibrated */
   ctx->last_vblank_ns = 0;
   ctx->next_commit_ns = 0;
 
-  drmModeCrtcPtr crtc = drmModeGetCrtc(ctx->drm_fd, ctx->crtc_id);
-  if (crtc && crtc->mode_valid && crtc->width > 0 && crtc->height > 0) {
-    ctx->crtc_width = crtc->width;
-    ctx->crtc_height = crtc->height;
-    if (crtc->mode.clock > 0 && crtc->mode.htotal > 0 && crtc->mode.vtotal > 0) {
-      uint64_t period = ((uint64_t)crtc->mode.htotal * (uint64_t)crtc->mode.vtotal * 1000000ULL) /
-                        (uint64_t)crtc->mode.clock;
+  if (active_mode.hdisplay > 0 && active_mode.vdisplay > 0) {
+    ctx->crtc_width = active_mode.hdisplay;
+    ctx->crtc_height = active_mode.vdisplay;
+    if (mode_valid && active_mode.clock > 0 && active_mode.htotal > 0 && active_mode.vtotal > 0) {
+      uint64_t period = ((uint64_t)active_mode.htotal * (uint64_t)active_mode.vtotal * 1000000ULL) /
+                        (uint64_t)active_mode.clock;
       if (period >= 8000000ULL && period <= 25000000ULL)
         ctx->vblank_period_ns = period;
     }
-  } else if (conn->count_modes > 0) {
-    ctx->crtc_width = conn->modes[0].hdisplay;
-    ctx->crtc_height = conn->modes[0].vdisplay;
   } else {
     ctx->crtc_width = 1920;
     ctx->crtc_height = 1080;
   }
-  if (crtc)
-    drmModeFreeCrtc(crtc);
-
-  drmModeFreeConnector(conn);
 
   /* Find CRTC index */
   int crtc_index = -1;

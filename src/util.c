@@ -17,12 +17,17 @@
  * along with Moonlight; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
+
 #include "util.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -62,5 +67,54 @@ bool ensure_buf_size(void **buf, size_t *buf_size, size_t required_size) {
     abort();
   }
 
+  return true;
+}
+
+bool configure_realtime_thread(pthread_t thread, int target_priority, uint32_t cpu_mask, const char *role) {
+  int min_prio = sched_get_priority_min(SCHED_FIFO);
+  int max_prio = sched_get_priority_max(SCHED_FIFO);
+  if (min_prio < 0 || max_prio < 0) {
+    min_prio = 1;
+    max_prio = 99;
+  }
+
+  if (target_priority < min_prio)
+    target_priority = min_prio;
+  if (target_priority > max_prio)
+    target_priority = max_prio;
+
+  struct sched_param param;
+  memset(&param, 0, sizeof(param));
+  param.sched_priority = target_priority;
+
+  int ret = pthread_setschedparam(thread, SCHED_FIFO, &param);
+  if (ret != 0) {
+    if (ret == EPERM) {
+      fprintf(stderr, "RT: Note: SCHED_FIFO for %s thread requires elevated permissions (CAP_SYS_NICE or rtprio limits). Continuing with default scheduler.\n", role);
+    } else {
+      fprintf(stderr, "RT: Note: pthread_setschedparam (%s) failed: %s (code %d). Continuing with default scheduler.\n", role, strerror(ret), ret);
+    }
+    return false;
+  }
+
+  if (cpu_mask != 0) {
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc > 1) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      int count = 0;
+      for (int cpu = 0; cpu < 32 && cpu < nproc; cpu++) {
+        if (cpu_mask & (1u << cpu)) {
+          CPU_SET(cpu, &cpuset);
+          count++;
+        }
+      }
+      if (count > 0 && pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset) != 0) {
+        fprintf(stderr, "RT: Note: pthread_setaffinity_np (%s) failed, keeping default affinity\n", role);
+      }
+    }
+  }
+
+  fprintf(stderr, "RT: Enabled SCHED_FIFO (%d) for %s thread\n", target_priority, role);
   return true;
 }

@@ -18,6 +18,7 @@
  */
 
 #include "audio.h"
+#include "../util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 
 #include <opus_multistream.h>
 #include <pulse/simple.h>
+#include <pulse/sample.h>
 #include <pulse/error.h>
 
 static OpusMSDecoder* decoder;
@@ -32,6 +34,7 @@ static pa_simple *dev = NULL;
 static short* pcmBuffer;
 static int samplesPerFrame;
 static int channelCount;
+static bool audio_rt_configured = false;
 
 bool audio_pulse_init(char* audio_device) {
   pa_sample_spec spec = {
@@ -82,8 +85,18 @@ static int pulse_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGU
   pa_channel_map map;
   pa_channel_map_init_auto(&map, opusConfig->channelCount, PA_CHANNEL_MAP_ALSA);
 
+  audio_rt_configured = false;
+
+  pa_buffer_attr attr = {
+    .maxlength = (uint32_t)pa_usec_to_bytes(80000, &spec),
+    .tlength = (uint32_t)pa_usec_to_bytes(40000, &spec),
+    .prebuf = (uint32_t)pa_usec_to_bytes(20000, &spec),
+    .minreq = (uint32_t)pa_usec_to_bytes(10000, &spec),
+    .fragsize = (uint32_t)-1,
+  };
+
   char* audio_device = (char*) context;
-  dev = pa_simple_new(NULL, "Moonlight Embedded", PA_STREAM_PLAYBACK, audio_device, "Streaming", &spec, &map, NULL, &error);
+  dev = pa_simple_new(NULL, "Moonlight Embedded", PA_STREAM_PLAYBACK, audio_device, "Streaming", &spec, &map, &attr, &error);
 
   if (!dev) {
     printf("Pulseaudio error: %s\n", pa_strerror(error));
@@ -94,6 +107,10 @@ static int pulse_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGU
 }
 
 static void pulse_renderer_decode_and_play_sample(char* data, int length) {
+  if (!audio_rt_configured) {
+    audio_rt_configured = true;
+    configure_realtime_thread(pthread_self(), 38, 0, "audio");
+  }
   int decodeLen = opus_multistream_decode(decoder, data, length, pcmBuffer, samplesPerFrame, 0);
   if (decodeLen > 0) {
     int error;
@@ -107,6 +124,7 @@ static void pulse_renderer_decode_and_play_sample(char* data, int length) {
 }
 
 static void pulse_renderer_cleanup() {
+  audio_rt_configured = false;
   if (decoder != NULL) {
     opus_multistream_decoder_destroy(decoder);
     decoder = NULL;

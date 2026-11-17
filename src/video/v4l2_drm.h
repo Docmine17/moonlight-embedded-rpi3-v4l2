@@ -24,6 +24,8 @@
 
 int v4l2_drm_init(struct v4l2_ctx *ctx);
 void v4l2_drm_destroy(struct v4l2_ctx *ctx);
+int v4l2_drm_calc_refresh_x100(const drmModeModeInfo *mode);
+int v4l2_drm_get_refresh_rate_x100(void);
 
 int v4l2_drm_import_capture_buffer(struct v4l2_ctx *ctx, int index);
 void v4l2_drm_release_capture_buffers(struct v4l2_ctx *ctx);

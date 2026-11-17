@@ -32,6 +32,7 @@ enum codecs { CODEC_UNSPECIFIED, CODEC_H264, CODEC_HEVC, CODEC_AV1 };
 enum platform platform_check(char*);
 PDECODER_RENDERER_CALLBACKS platform_get_video(enum platform system);
 PAUDIO_RENDERER_CALLBACKS platform_get_audio(enum platform system, char* audio_device);
+int platform_get_refresh_rate_x100(enum platform system);
 bool platform_prefers_codec(enum platform system, enum codecs codec);
 char* platform_name(enum platform system);
 

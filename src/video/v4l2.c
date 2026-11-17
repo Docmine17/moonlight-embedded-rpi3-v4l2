@@ -41,30 +41,9 @@
 
 static struct v4l2_ctx v4l2_instance;
 
-static void configure_realtime_thread(pthread_t thread, int target_priority, const char *role) {
-  int min_prio = sched_get_priority_min(SCHED_FIFO);
-  int max_prio = sched_get_priority_max(SCHED_FIFO);
-  if (min_prio < 0 || max_prio < 0) {
-    min_prio = 1;
-    max_prio = 99;
-  }
-
-  /* Clamp priority safely within system bounds */
-  if (target_priority < min_prio) target_priority = min_prio;
-  if (target_priority > max_prio) target_priority = max_prio;
-
-  struct sched_param param;
-  memset(&param, 0, sizeof(param));
-  param.sched_priority = target_priority;
-
-  int ret = pthread_setschedparam(thread, SCHED_FIFO, &param);
-  if (ret == 0) {
-    fprintf(stderr, "V4L2: Successfully enabled SCHED_FIFO real-time priority (%d) for %s thread\n", target_priority, role);
-  } else if (ret == EPERM) {
-    fprintf(stderr, "V4L2: Note: SCHED_FIFO for %s thread requires elevated permissions (CAP_SYS_NICE or rtprio limits in /etc/security/limits.conf). Continuing with default scheduler.\n", role);
-  } else {
-    fprintf(stderr, "V4L2: Note: pthread_setschedparam (%s) failed: %s (code %d). Continuing with default scheduler.\n", role, strerror(ret), ret);
-  }
+static uint32_t v4l2_rt_cpu_mask(uint32_t quad_core_mask) {
+  long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+  return (nproc >= 4) ? quad_core_mask : 0;
 }
 
 static void *v4l2_event_thread(void *arg) {
@@ -235,8 +214,8 @@ static int v4l2_setup(int videoFormat, int width, int height, int redrawRate, vo
     return -1;
   }
 
-  /* Elevate display presentation thread to real-time priority (45: optimal for video display) */
-  configure_realtime_thread(v4l2_instance.event_thread, 45, "display");
+  /* Elevate display presentation thread to real-time priority (45) off CPU 0 USB/NIC IRQs */
+  configure_realtime_thread(v4l2_instance.event_thread, 45, v4l2_rt_cpu_mask((1u << 2) | (1u << 3)), "display");
 
 #ifdef V4L2_BENCHMARK
   v4l2_instance.stats.window_start_ns = v4l2_now_ns();
@@ -336,7 +315,7 @@ static int v4l2_submit_decode_unit(PDECODE_UNIT decodeUnit) {
 
   if (!v4l2_instance.submit_rt_configured) {
     v4l2_instance.submit_rt_configured = true;
-    configure_realtime_thread(pthread_self(), 40, "submit");
+    configure_realtime_thread(pthread_self(), 40, v4l2_rt_cpu_mask((1u << 1) | (1u << 2) | (1u << 3)), "submit");
   }
 
 #ifdef V4L2_BENCHMARK

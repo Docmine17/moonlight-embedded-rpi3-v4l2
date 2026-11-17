@@ -18,7 +18,9 @@
  */
 
 #include "audio.h"
+#include "../util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +33,8 @@ static snd_pcm_t *handle;
 static OpusMSDecoder* decoder;
 static short* pcmBuffer;
 static int samplesPerFrame;
+static int channelCount;
+static bool audio_rt_configured = false;
 
 static int alsa_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int arFlags) {
   int rc;
@@ -49,16 +53,19 @@ static int alsa_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGUR
   }
 
   samplesPerFrame = opusConfig->samplesPerFrame;
+  channelCount = opusConfig->channelCount;
   pcmBuffer = malloc(sizeof(short) * opusConfig->channelCount * samplesPerFrame);
   if (pcmBuffer == NULL)
     return -1;
 
   decoder = opus_multistream_decoder_create(opusConfig->sampleRate, opusConfig->channelCount, opusConfig->streams, opusConfig->coupledStreams, alsaMapping, &rc);
 
+  audio_rt_configured = false;
+
   snd_pcm_hw_params_t *hw_params;
   snd_pcm_sw_params_t *sw_params;
-  snd_pcm_uframes_t period_size = (opusConfig->sampleRate * 20) / 1000; // 20 ms period
-  snd_pcm_uframes_t buffer_size = 3 * period_size; // 60 ms buffer
+  snd_pcm_uframes_t period_size = (opusConfig->sampleRate * 10) / 1000; // 10 ms period
+  snd_pcm_uframes_t buffer_size = 4 * period_size; // 40 ms buffer
   unsigned int sampleRate = opusConfig->sampleRate;
 
   char* audio_device = (char*) context;
@@ -84,7 +91,7 @@ static int alsa_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGUR
   CHECK_RETURN(snd_pcm_sw_params_malloc(&sw_params));
   CHECK_RETURN(snd_pcm_sw_params_current(handle, sw_params));
   CHECK_RETURN(snd_pcm_sw_params_set_avail_min(handle, sw_params, period_size));
-  CHECK_RETURN(snd_pcm_sw_params_set_start_threshold(handle, sw_params, period_size));
+  CHECK_RETURN(snd_pcm_sw_params_set_start_threshold(handle, sw_params, 2 * period_size));
   CHECK_RETURN(snd_pcm_sw_params(handle, sw_params));
   snd_pcm_sw_params_free(sw_params);
 
@@ -94,6 +101,7 @@ static int alsa_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGUR
 }
 
 static void alsa_renderer_cleanup() {
+  audio_rt_configured = false;
   if (decoder != NULL) {
     opus_multistream_decoder_destroy(decoder);
     decoder = NULL;
@@ -112,19 +120,33 @@ static void alsa_renderer_cleanup() {
 }
 
 static void alsa_renderer_decode_and_play_sample(char* data, int length) {
+  if (!audio_rt_configured) {
+    audio_rt_configured = true;
+    configure_realtime_thread(pthread_self(), 38, 0, "audio");
+  }
+
   int decodeLen = opus_multistream_decode(decoder, data, length, pcmBuffer, samplesPerFrame, 0);
   if (decodeLen > 0) {
-    int rc = snd_pcm_writei(handle, pcmBuffer, decodeLen);
-    if (rc < 0) {
-      rc = snd_pcm_recover(handle, rc, 0);
-      if (rc == 0)
-        rc = snd_pcm_writei(handle, pcmBuffer, decodeLen);
+    int offset = 0;
+    int retries = 0;
+    while (offset < decodeLen) {
+      int rc = (int)snd_pcm_writei(handle, pcmBuffer + offset * channelCount, decodeLen - offset);
+      if (rc > 0) {
+        offset += rc;
+        continue;
+      }
+      if (rc == -EAGAIN && retries++ < 2) {
+        if (snd_pcm_wait(handle, 20) >= 0)
+          continue;
+      }
+      if (rc < 0) {
+        int rec = snd_pcm_recover(handle, rc, 0);
+        if (rec == 0 && retries++ < 2)
+          continue;
+        printf("Alsa error from writei: %d\n", rc);
+      }
+      break;
     }
-
-    if (rc<0)
-      printf("Alsa error from writei: %d\n", rc);
-    else if (decodeLen != rc)
-      printf("Alsa shortm write, write %d frames\n", rc);
   } else if (decodeLen < 0) {
     printf("Opus error from decode: %d\n", decodeLen);
   }
