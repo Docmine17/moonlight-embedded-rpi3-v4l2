@@ -79,7 +79,7 @@ static void rumble(unsigned short controllerNumber, unsigned short lowFreqMotor,
 }
 
 static void rumble_triggers(unsigned short controllerNumber, unsigned short leftTrigger, unsigned short rightTrigger) {
-  if (rumble_handler)
+  if (rumble_triggers_handler)
     rumble_triggers_handler(controllerNumber, leftTrigger, rightTrigger);
 }
 
