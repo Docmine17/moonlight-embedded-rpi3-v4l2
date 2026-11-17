@@ -38,6 +38,7 @@
 #include <limits.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #ifdef __linux__
 #include <endian.h>
 #else
@@ -1081,6 +1082,14 @@ void evdev_start() {
 
   // Any new input devices detected after this point will be grabbed immediately
   grabbingDevices = true;
+
+  // The calling (main) thread runs loop_main() and handles every evdev event, so give it
+  // real-time priority (best effort; needs CAP_SYS_NICE or an rtprio limit).
+  struct sched_param sp;
+  memset(&sp, 0, sizeof(sp));
+  sp.sched_priority = 42;
+  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0)
+    fprintf(stderr, "Input: SCHED_FIFO 42 enabled for input thread\n");
 
   // Handle input events until the quit combo is pressed
 }
